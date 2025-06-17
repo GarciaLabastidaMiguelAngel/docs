@@ -1,0 +1,66 @@
+
+%% Diagram 1: Extracción Mainframe y registro en BD vía add-notification-job
+```mermaid
+sequenceDiagram
+    participant ControlM as Control-M
+    participant JCL_Extract as JCL MTU Extract (Mainframe)
+    participant MainframeDB as DB2 Mainframe
+    participant StorageMF as Mainframe File Storage
+    participant SFTP as SFTP Service
+    participant BatchMTU as MTU Batch Processor
+    participant addNotifJob as add-notification-job
+    participant OracleDB as Oracle MTU Notifications DB
+    participant CatAvg as Catálogo Promedio
+    participant CatSeg as Catálogo Segmento
+
+    ControlM->>JCL_Extract: Trigger MTU extract job
+    JCL_Extract->>MainframeDB: Select customers without MTU
+    loop For each eligible customer
+        JCL_Extract->>MainframeDB: Update status = "pending batch notification"
+        JCL_Extract->>StorageMF: Write to MTUextract.csv (customerId, segment)
+    end
+    JCL_Extract->>SFTP: Transfer MTUextract.csv to BatchMTU
+
+    ControlM->>addNotifJob: Trigger add-notification-job
+    addNotifJob->>BatchMTU: Read MTUextract.csv
+    loop For each customer
+        addNotifJob->>OracleDB: Check if notification exists
+        alt Already exists
+            addNotifJob->>OracleDB: Register event as trace only
+        else New notification
+            addNotifJob->>CatAvg: Check for transaction average
+            alt Average exists
+                addNotifJob->>addNotifJob: Use average amount
+            else
+                addNotifJob->>CatSeg: Get amount by segment
+            end
+            addNotifJob->>addNotifJob: Generate UUID, retries = 0, status = pending
+            addNotifJob->>OracleDB: Insert new notification record (UUID, customerId, amount, source, status)
+        end
+    end
+```
+
+
+
+%% Diagram 2: Generación de archivo de notificaciones hacia Smart Notification
+```mermaid
+sequenceDiagram
+    participant ControlM as Control-M
+    participant notificationsJob as notifications-job
+    participant OracleDB as Oracle MTU Notifications DB
+    participant SmartNotif as Smart Notification Batch
+    participant SFTP as SFTP Service
+
+    ControlM->>notificationsJob: Trigger notifications-job
+
+    notificationsJob->>OracleDB: Query notifications with status = pending and retries < max
+    loop For each notification
+        notificationsJob->>notificationsJob: Check if not expired or already delivered
+        notificationsJob->>notificationsJob: Consolidate valid UUIDs for notification
+    end
+
+    notificationsJob->>notificationsJob: Generate notification file (UUID, customerId, amount, source, tipo_notif)
+    notificationsJob->>SFTP: Transfer notification file to Smart Notification
+    notificationsJob->>SmartNotif: Notify SmartNotif that file is available
+    SmartNotif-->>notificationsJob: Acknowledge
+```
