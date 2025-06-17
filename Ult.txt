@@ -1,0 +1,213 @@
+
+%% Diagram 1: Extraction and Notification with Retry Logic (Monto Persisted)
+```mermaid
+sequenceDiagram
+    participant ControlM as Control-M Scheduler
+    participant JCL_Extraction as JCL Extraction (Mainframe)
+    participant MainframeDB as Mainframe DB
+    participant Storage as Mainframe File Storage
+    participant BatchMTU as MTU Batch Processor
+    participant DBMTU as MTU Open DB
+    participant CatAvg as Customer Average Catalog
+    participant CatFault as Segment Fault Catalog
+    participant SmartNotif as Smart Notification Batch
+
+    ControlM->>JCL_Extraction: Trigger customer extraction
+    JCL_Extraction->>JCL_Extraction: Apply rules (customers without MTU)
+    loop For each eligible customer
+        JCL_Extraction->>MainframeDB: Set status = "pending batch notification"
+        JCL_Extraction->>Storage: Write record to interface (customerId, segment)
+    end
+    JCL_Extraction->>BatchMTU: Transfer file via SFTP
+
+    BatchMTU->>BatchMTU: Parse interface file
+    loop For each customer
+        BatchMTU->>DBMTU: Check if notification already exists
+        alt Already notified
+            BatchMTU-->>DBMTU: Skip (trace only)
+        else New notification
+            BatchMTU->>CatAvg: Check for transaction average
+            alt Has average
+                BatchMTU->>BatchMTU: Assign amount from average
+            else
+                BatchMTU->>CatFault: Assign amount from segment default
+            end
+            BatchMTU->>DBMTU: Insert notification record (UUID, customerId, amount, retries=0, status="pending")
+        end
+    end
+
+    BatchMTU->>SmartNotif: Send notification file (only new valid UUIDs)
+    BatchMTU->>SmartNotif: Notify file availability
+    SmartNotif-->>BatchMTU: Acknowledge
+```
+
+sequenceDiagram
+    participant DataLake as Data Lake
+    participant BatchMTU as MTU Batch Processor
+    participant DBMTU as MTU Open DB
+    participant ControlM as Control-M Scheduler
+    participant JCL_Update as JCL Update (Mainframe)
+    participant MainframeDB as Mainframe DB
+
+    DataLake->>BatchMTU: Send file with UUID, customerId, status, timestamp
+    loop Each response
+        BatchMTU->>DBMTU: Validate UUID and compare timestamps
+        alt Valid and latest
+            BatchMTU->>DBMTU: Update status = "delivered"
+        else
+            BatchMTU->>DBMTU: Mark response as ignored
+        end
+    end
+
+    ControlM->>BatchMTU: Trigger update generation
+    BatchMTU->>DBMTU: Get notifications with status = "delivered"
+    loop For each delivered record
+        BatchMTU->>DBMTU: Read stored amount from notification
+        BatchMTU->>BatchMTU: Build update record (customerId, amount)
+    end
+    BatchMTU->>JCL_Update: Send update file via SFTP
+
+    JCL_Update->>MainframeDB: Process each update
+    loop Each record
+        JCL_Update->>MainframeDB: Check if MTU already defined
+        alt Already defined
+            JCL_Update-->>MainframeDB: Skip update
+        else
+            JCL_Update->>MainframeDB: Apply amount from notification
+            JCL_Update->>MainframeDB: Set status = "set by batch"
+        end
+    end
+```
+
+%% Diagram 3: Generation of Customer Average Catalog
+```mermaid
+sequenceDiagram
+    participant DataLake as Data Lake
+    participant BatchMTU as MTU Batch Processor
+    participant CatAvg as Customer Average Catalog
+
+    DataLake->>BatchMTU: Deliver file with customer averages
+    loop For each entry
+        BatchMTU->>CatAvg: Store/update customer average
+    end
+```
+
+%% Diagram 4: Cleanup Process
+```mermaid
+sequenceDiagram
+    participant ControlM as Control-M Scheduler
+    participant BatchMTU as MTU Batch Processor
+    participant DBMTU as MTU Open DB
+
+    ControlM->>BatchMTU: Initiate cleanup
+    BatchMTU->>DBMTU: Identify records past retention
+    BatchMTU->>DBMTU: Archive or delete records
+```
+
+%% Diagram 5: Notification Status Update from Data Lake
+```mermaid
+sequenceDiagram
+    participant DataLake as Data Lake
+    participant BatchMTU as MTU Batch Processor
+    participant DBMTU as MTU Open DB
+
+    DataLake->>BatchMTU: Send file (notificationId, customerId, status)
+    BatchMTU->>BatchMTU: Parse each entry in the file
+    loop For each record
+        BatchMTU->>DBMTU: Match notificationId (UUID) in database
+        alt Found match
+            BatchMTU->>DBMTU: Update status based on response
+        else No match
+            BatchMTU->>BatchMTU: Log error or ignore record
+        end
+    end
+``
+%% Diagram 6: Pre-Update Evaluation Logic for Mainframe MTU Assignment
+```mermaid
+sequenceDiagram
+    participant ControlM as Control-M Scheduler (2:00 AM)
+    participant BatchMTU as MTU Batch Processor
+    participant DBMTU as MTU Open DB
+    participant CatAvg as Customer Average Catalog
+    participant CatFault as Segment Fault Catalog
+    participant JCL_Update as JCL Update (Mainframe)
+    participant MainframeDB as Mainframe DB
+
+    ControlM->>BatchMTU: Start mainframe update job
+    BatchMTU->>DBMTU: Retrieve customers with pending update and delivered notifications
+
+    loop For each customerId
+        BatchMTU->>DBMTU: Get all delivered notifications
+        alt Multiple delivered notifications
+            BatchMTU->>BatchMTU: Select latest successful notification
+            BatchMTU->>BatchMTU: Use amount from latest notification
+        else Only one delivered
+            BatchMTU->>BatchMTU: Use amount from that notification
+        else No delivered notification
+            BatchMTU->>DBMTU: Check if max wait days exceeded
+            alt Max wait exceeded
+                BatchMTU->>DBMTU: Check for older delivered notifications
+                alt Older notification found
+                    BatchMTU->>BatchMTU: Use amount from last known delivered
+                else None found
+                    BatchMTU->>CatAvg: Check average for customer
+                    alt Has average
+                        BatchMTU->>BatchMTU: Use average as fallback amount
+                    else
+                        BatchMTU->>CatFault: Use segment fault amount
+                    end
+                    BatchMTU->>BatchMTU: Mark update reason = "notification not delivered"
+                end
+            else Still within wait window
+                BatchMTU-->>BatchMTU: Skip this customer for now
+            end
+        end
+    end
+
+    BatchMTU->>JCL_Update: Send final update file via SFTP
+    JCL_Update->>MainframeDB: Apply updates per business logic
+```
+
+%% Diagram 2: Mainframe Update Process (Starts from File, Applies All Conditions)
+```mermaid
+sequenceDiagram
+    participant BatchMTU as MTU Batch Processor
+    participant DBMTU as MTU Open DB
+    participant CatAvg as Customer Average Catalog
+    participant ControlM as Control-M Scheduler
+    participant JCL_Update as JCL Update (Mainframe)
+    participant MainframeDB as Mainframe DB
+
+    ControlM->>BatchMTU: Trigger batch process at 2:00 a.m.
+    BatchMTU->>BatchMTU: Read file with notification responses (already present)
+
+    loop For each customerId
+        BatchMTU->>DBMTU: Fetch delivered notifications
+        alt Multiple delivered
+            BatchMTU->>BatchMTU: Use amount from latest notification
+        else One delivered
+            BatchMTU->>BatchMTU: Use that amount
+        else None delivered
+            BatchMTU->>DBMTU: Check if max wait days exceeded
+            alt Exceeded
+                BatchMTU->>CatAvg: Get average from catalog
+                BatchMTU->>BatchMTU: Mark status = "not notified, fallback used"
+            else Not yet exceeded
+                BatchMTU-->>BatchMTU: Skip customer this cycle
+            end
+        end
+        BatchMTU->>BatchMTU: Add record to update file (customerId, amount, final status)
+    end
+
+    BatchMTU->>JCL_Update: Send update file via SFTP
+    JCL_Update->>MainframeDB: Process update records
+    loop Per customer
+        JCL_Update->>MainframeDB: Check if MTU set by customer
+        alt Already set
+            JCL_Update-->>MainframeDB: Skip update
+        else
+            JCL_Update->>MainframeDB: Apply received amount
+            JCL_Update->>MainframeDB: Set status = "set by batch" or "defaulted by fallback"
+        end
+    end
+```
