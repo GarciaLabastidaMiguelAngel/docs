@@ -1,0 +1,81 @@
+
+Descripción detallada de los Jobs – MTU Batch Notifications (versión actualizada)
+
+1. cat-trx-average-job
+Finalidad:
+Procesar el archivo transational_average.csv desde Data Lake para actualizar el catálogo de promedios transaccionales por cliente.
+
+Lógica:
+- Leer archivo vía SFTP.
+- Validar estructura (CSV sin encabezados).
+- Para cada registro:
+  - customerId, averageAmount
+  - Insertar o actualizar en catálogo catalogo_trx_average.
+- Registrar fecha de actualización por cliente.
+
+2. responses-datalake-job
+Finalidad:
+Procesar el archivo notificationResponses.csv con los resultados de entrega de Smart Notification.
+
+Lógica:
+- Leer archivo vía SFTP.
+- Para cada línea:
+  - UUID, customerId, status, timestamp
+  - Validar existencia del UUID en base de datos.
+  - Si es válido y más reciente:
+    - Actualizar status = delivered o failed.
+    - Registrar response_timestamp.
+  - Si es inválido o duplicado, registrar en bitácora.
+
+3. add-notification-job
+Finalidad:
+Procesar la interfaz MTUextract.csv proveniente de Mainframe y generar los registros de notificación en base de datos.
+
+Lógica:
+- Leer archivo MTUextract.csv desde sistema de archivos.
+- Por cada customerId:
+  - Verificar en DB si ya hay notificación en curso.
+    - Si existe, registrar solo trazabilidad del evento.
+    - Si no existe:
+      - Consultar catálogo promedio.
+      - Si no hay, consultar catálogo por segmento.
+      - Generar UUID.
+      - Persistir en Oracle: notificationId, customerId, monto, retries = 0, status = pending.
+
+4. notifications-job
+Finalidad:
+Extraer desde Oracle todas las notificaciones nuevas y reintentos válidos para consolidar un solo archivo hacia Smart Notification.
+
+Lógica:
+- Consultar en Oracle notificaciones con status = pending y retries < máximo.
+- Para cada registro válido:
+  - Incluir en archivo de salida.
+- Generar archivo consolidado (.csv) con UUID, customerId, monto, motivo, etc.
+- Enviar vía SFTP a Smart Notification.
+- Notificar disponibilidad.
+
+5. update-mainframe-job
+Finalidad:
+Aplicar en DB2 el MTU de los clientes, a partir de notificaciones entregadas y reglas de tiempo.
+
+Lógica:
+- Ejecutar a las 2:00 a.m.
+- Leer desde Oracle:
+  - Notificaciones con status = delivered, o
+  - Clientes que superaron límite de espera.
+- Evaluar:
+  - Si hay múltiples entregas, tomar la más reciente.
+  - Si no hay entrega y venció el tiempo, usar catálogo promedio.
+  - Si aún está dentro de tiempo de espera, omitir.
+- Generar archivo .csv para JCL update.
+- Enviar a Mainframe por SFTP.
+- Actualizar status = set_by_batch o fallback.
+
+6. cleanup-job
+Finalidad:
+Eliminar registros antiguos con status final o sin relevancia, y mantener integridad.
+
+Lógica:
+- Consultar notificaciones con status final y antigüedad > N días.
+- Eliminar registros innecesarios.
+- Registrar o exportar a log externo si aplica.
