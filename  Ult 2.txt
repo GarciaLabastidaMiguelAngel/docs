@@ -1,0 +1,42 @@
+
+%% Diagram 2: Mainframe Update (Data From Database, Not File)
+```mermaid
+sequenceDiagram
+    participant BatchMTU as MTU Batch Processor
+    participant DBMTU as MTU Open DB
+    participant CatAvg as Customer Average Catalog
+    participant ControlM as Control-M Scheduler
+    participant JCL_Update as JCL Update (Mainframe)
+    participant MainframeDB as Mainframe DB
+
+    ControlM->>BatchMTU: Trigger update batch at 2:00 a.m.
+
+    BatchMTU->>DBMTU: Query notifications with status = "delivered" or expired waiting
+
+    loop For each customer
+        BatchMTU->>DBMTU: Get all notifications (ordered by timestamp)
+        alt Has delivered notifications
+            BatchMTU->>BatchMTU: Select latest delivered UUID
+            BatchMTU->>DBMTU: Get stored amount from that UUID
+            BatchMTU->>BatchMTU: Set status = "set by batch"
+        else Max wait days exceeded and no delivery
+            BatchMTU->>CatAvg: Retrieve average amount from catalog
+            BatchMTU->>BatchMTU: Set status = "defaulted by fallback"
+        else Still waiting
+            BatchMTU-->>BatchMTU: Skip this customer
+        end
+        BatchMTU->>BatchMTU: Add record to update file (customerId, amount, final status)
+    end
+
+    BatchMTU->>JCL_Update: Send update file via SFTP
+    JCL_Update->>MainframeDB: Process update records
+    loop For each customer
+        JCL_Update->>MainframeDB: Check if MTU already set by customer
+        alt Already set
+            JCL_Update-->>MainframeDB: Skip update
+        else
+            JCL_Update->>MainframeDB: Apply amount
+            JCL_Update->>MainframeDB: Set status accordingly
+        end
+    end
+```
