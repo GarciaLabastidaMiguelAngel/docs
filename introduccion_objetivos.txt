@@ -1,0 +1,19 @@
+
+Introducción
+
+En el contexto actual de BANCO_PEQ, múltiples APIs están experimentando un crecimiento considerable en su complejidad operativa. Este crecimiento se debe, en gran medida, a que la lógica de negocio de muchas de estas APIs depende de múltiples sistemas fuente, bases de datos distribuidas o servicios intermedios que deben ser orquestados en línea para satisfacer una sola petición de cliente. Este modelo genera altos tiempos de respuesta, aumenta el acoplamiento técnico entre sistemas y reduce la capacidad de evolución modular de la plataforma.
+
+Como respuesta a esta problemática, surge la necesidad de un modelo de integración más eficiente y resiliente, capaz de anticipar la generación de los objetos de datos que se exponen al cliente. En este sentido, se propone la construcción de un Middleware de DTOs (Data Transfer Objects), una plataforma desacoplada, orientada a eventos, que genere los DTOs de manera anticipada a partir de información replicada o eventos emitidos por sistemas fuente, permitiendo así que las APIs (u otros sistemas consumidores) accedan a vistas ya consolidadas de los datos.
+
+Este Middleware, que en su diseño técnico se compone de elementos modulares como el DTO Generator, Event Generator y Conciliator, permite adaptar su comportamiento para cada API o contexto de negocio, manteniendo un enfoque basado en estándares como BIAN, y promoviendo la reutilización, resiliencia, trazabilidad y eficiencia operativa.
+
+Objetivos
+
+- Desacoplar la lógica de orquestación en línea desde las APIs hacia una capa intermedia especializada.
+- Centralizar y normalizar la información del cliente mediante la generación de objetos DTO persistidos por Customer Position (o modelos equivalentes como Customer Profile en APIs de canal).
+- Generar objetos de datos (DTOs) listos para ser consumidos por APIs u otros sistemas, a partir de eventos provenientes de sistemas fuente, plataformas de integración o réplicas técnicas (CDC).
+- Permitir la consolidación de múltiples eventos mediante lógica de backpressure, evitando escrituras innecesarias y garantizando consistencia.
+- Establecer mecanismos de fallback configurables, con reintentos asíncronos en escenarios de falla.
+- Facilitar la integración de balances en los DTOs solo cuando sea necesario, utilizando un componente especializado para agregarlos atómicamente.
+- Permitir la escalabilidad horizontal de los componentes por configuración, sin necesidad de recodificación.
+- Mantener el control sobre el ciclo de vida del caché mediante TTL gestionado por la plataforma de APIs, asegurando coherencia de los datos en cache y origen.
