@@ -1,0 +1,90 @@
+
+Figura 4 – Arquitectura Funcional del Middleware de DTOs
+
+Descripción general para el lector:
+
+La figura presenta el diseño funcional de alto nivel del Middleware de DTOs, una plataforma que opera como intermediario entre las fuentes de datos del banco y los consumidores internos de información. Su función es construir, mantener y disponibilizar objetos de datos (DTOs) de forma desacoplada, eficiente y confiable, a partir de eventos técnicos emitidos por sistemas fuente.
+
+El Middleware está compuesto por tres componentes principales:
+
+1. DTO Generator: Responsable de recibir eventos y generar el DTO correspondiente. Una vez generado, este objeto es almacenado en dos tipos de repositorios: uno de acceso rápido y otro persistente.
+
+2. Event Generator: Componente transversal que se encarga de emitir eventos. Este componente centraliza la publicación de eventos derivados de cualquier acción del Middleware, como generación exitosa de DTOs, conciliaciones, o eventos adicionales identificados durante el procesamiento.
+
+3. Conciliator: Se activa en los casos donde la generación del DTO falla. Intenta resolver el caso mediante consultas inmediatas o, si es necesario, planifica reintentos asincrónicos. Una vez resuelto, genera un nuevo evento que regresa al flujo normal para actualizar el DTO.
+
+Los objetos generados por esta plataforma son almacenados en un esquema de doble repositorio:
+- Una base de datos de acceso rápido, utilizada como punto principal de consulta.
+- Una base de datos persistente, que actúa como respaldo y fuente confiable de recuperación.
+
+Los sistemas consumidores —como APIs internas u otros servicios— interactúan con estos repositorios según sus necesidades. El modelo también contempla la posibilidad de emitir nuevos eventos cuando un DTO ha sido actualizado o conciliado, permitiendo a otros sistemas reaccionar en consecuencia.
+
+Diagramas de secuencia
+
+Diagram 1 – DTO Generation from Events
+
+```mermaid
+sequenceDiagram
+    participant EventBroker
+    participant EventConsumer
+    participant DTOGenerator
+    participant FastStorage
+    participant PersistentStorage
+
+    EventBroker->>EventConsumer: Deliver raw event
+    EventConsumer->>DTOGenerator: Forward event
+    DTOGenerator->>DTOGenerator: Process and compose DTO
+    DTOGenerator->>FastStorage: Save DTO to fast-access storage
+    DTOGenerator->>PersistentStorage: Save DTO to persistent storage
+```
+
+Diagram 2 – Fallback and Conciliation on Failure
+
+```mermaid
+sequenceDiagram
+    participant DTOGenerator
+    participant EventGenerator
+    participant Conciliator
+    participant EventGenerator2
+    participant DTOGeneratorRetry
+
+    DTOGenerator->>EventGenerator: Notify failure
+    EventGenerator->>Conciliator: Send event for conciliation
+    Conciliator->>Conciliator: Try NRT resolution or retry
+    Conciliator->>EventGenerator2: Publish reconciled event
+    EventGenerator2->>DTOGeneratorRetry: Retry generation with corrected data
+```
+
+Diagram 3 – Consumer System Access Logic
+
+```mermaid
+sequenceDiagram
+    participant ConsumerSystem
+    participant FastStorage
+    participant PersistentStorage
+
+    ConsumerSystem->>FastStorage: Query DTO
+    alt DTO not available
+        ConsumerSystem->>PersistentStorage: Query fallback DTO
+    end
+```
+
+Diagram 4 – Generation of New Events by the Platform
+
+```mermaid
+sequenceDiagram
+    participant EventConsumer
+    participant DTOGenerator
+    participant Conciliator
+    participant EventGenerator
+    participant EventBroker
+
+    alt Successful DTO generation
+        DTOGenerator->>EventGenerator: Emit derived event
+    else DTO reconciled
+        Conciliator->>EventGenerator: Emit post-reconciliation event
+    else Detected new business condition
+        EventConsumer->>EventGenerator: Request derived event
+    end
+    EventGenerator->>EventBroker: Publish new event
+```
