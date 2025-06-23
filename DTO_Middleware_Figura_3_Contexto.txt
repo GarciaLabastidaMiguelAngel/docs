@@ -1,0 +1,23 @@
+Figura 3 – Contexto: Solución 2 – Plataforma de Integración DTO Middleware con persistencia y cache L1
+
+Descripción general:
+Esta imagen representa una solución evolutiva que aborda los retos de orquestación y latencia expuestos anteriormente mediante la introducción de una plataforma de integración denominada “DTO Middleware”. Esta solución incorpora una arquitectura basada en eventos, orientada a capturar los cambios de datos desde las fuentes principales (mainframe, bases de datos operacionales, subsistemas) y construir un objeto de datos estructurado (DTO) persistente y estandarizado. 
+
+Este objeto (por ejemplo, `CustomerPosition`, conforme al estándar BIAN), se materializa en un repositorio estructurado y puede ser accedido de manera directa por las APIs consumidoras u otros sistemas.
+
+Principales aportaciones:
+- Introducción de un middleware desacoplado que se alimenta de eventos emitidos por los sistemas fuente mediante un broker de eventos.
+- Materialización anticipada de un DTO persistente en base de datos, con un modelo optimizado para consulta por los consumidores.
+- Disponibilización de una cache de primer nivel (L1), por ejemplo en Redis, como almacenamiento primario de acceso rápido.
+- Simplificación de las APIs, que pasan de ejecutar múltiples integraciones a únicamente consultar el DTO (vía cache o base de datos).
+- Facilidad de aplicar políticas TTL y proyecciones parciales sobre los datos, adaptadas al consumidor.
+
+Consideraciones adicionales:
+- Los eventos provenientes de data sources son consumidos y procesados por el middleware, el cual genera un objeto BIAN DTO (por ejemplo `CustomerPosition`) consolidado por customerId.
+- Este DTO es almacenado tanto en una base de datos estructurada como en una cache en memoria (TTL).
+- Las APIs consumidoras ya no requieren realizar múltiples integraciones, sino que ejecutan una simple query por customerId y proyectan únicamente los campos requeridos.
+- La solución permite políticas diferenciadas de TTL según el tipo de consumidor (por ejemplo, APIs vs. otros sistemas internos).
+- Se mantiene la posibilidad de fallback opcional hacia la orquestación AS-IS en caso de error o falta de disponibilidad del DTO.
+- El modelo permite generar nuevos eventos derivados a partir de los cambios detectados y la actualización del DTO central.
+
+Este diseño se alinea con los principios de desacoplamiento, estandarización (BIAN), resiliencia, y eficiencia en respuesta en tiempo real para el cliente final.
