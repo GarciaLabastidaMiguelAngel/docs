@@ -1,0 +1,113 @@
+Figura 5 – Detalle del componente DTO Generator y sus subcomponentes
+
+Descripción general:
+Esta figura presenta el desglose funcional del componente “DTO Generator” dentro del DTO Middleware, mostrando sus subcomponentes clave y su interacción con los eventos y repositorios de datos.
+
+Subcomponentes:
+
+1. DTO Composer:
+   - Es el encargado de recibir los eventos provenientes del Event Consumer y componer el DTO funcional correspondiente (por ejemplo, Customer Position, Customer Profile, etc.).
+   - Este subcomponente no tiene dependencia del componente de balances; opera de forma aislada cuando los eventos funcionales no requieren lógica contable.
+   - Si el DTO Composer falla en generar un DTO válido, delega el evento al subcomponente DTO Fallback, utilizando el Event Generator para propagar el fallo al Conciliator.
+
+2. DTO Persist:
+   - Se encarga de persistir el DTO generado en dos repositorios:
+     a. Primary DB: repositorio de acceso rápido.
+     b. Secondary DB: repositorio persistente.
+   - También se encarga de propagar eventos de tipo actualización (update events) hacia el Event Generator.
+   - Es quien realiza el merge entre lo que construyó el DTO Composer y, en su caso, lo que el subcomponente de balances haya generado.
+
+3. Balances:
+   - Responsable de generar la parte del DTO relacionada con balances financieros, si aplica.
+   - No es invocado por DTO Composer, sino que recibe eventos directamente del Event Consumer.
+   - En escenarios simples puede calcular los balances a partir de eventos; en otros casos, utiliza queries directos hacia los sistemas fuente (ej. DB2 u Oracle).
+   - Utiliza DTO Persist para almacenar los datos y DTO Fallback en caso de error.
+
+4. DTO Fallback:
+   - Recibe fallos desde DTO Composer o Balances.
+   - Utiliza Event Generator para generar un evento de conciliación que será procesado por el componente Conciliator.
+   - Si el Conciliator logra recuperar la información, un nuevo evento conciliado se propaga hacia DTO Composer para intentar generar el DTO nuevamente.
+
+Subcomponente transversal:
+
+- Event Consumer:
+  - Subcomponente que centraliza la lectura de eventos desde el Event Broker.
+  - Su propósito es evitar múltiples lectores sobre los mismos tópicos, optimizando el tráfico hacia el Middleware.
+  - Distribuye internamente los eventos entre DTO Composer, Balances, o DTO Fallback según corresponda.
+
+Comunicaciones destacadas:
+- Todos los eventos generados por DTO Composer, DTO Persist y DTO Fallback se emiten usando el componente Event Generator.
+- El merge de los datos funcionales y contables se realiza dentro de DTO Persist.
+- El Event Generator sirve como puente de comunicación entre DTO Generator y Conciliator.
+
+Diagramas de secuencia (en inglés):
+
+1. DTO composition and persistence:
+```mermaid
+sequenceDiagram
+    participant EventConsumer
+    participant DTOComposer
+    participant DTOPersist
+    participant EventGenerator
+    participant PrimaryDB
+    participant SecondaryDB
+
+    EventConsumer->>DTOComposer: deliver functional events
+    DTOComposer->>DTOPersist: send composed DTO
+    DTOPersist->>PrimaryDB: persist DTO
+    DTOPersist->>SecondaryDB: persist DTO
+    DTOPersist->>EventGenerator: emit update event
+```
+
+2. Balances-only update:
+```mermaid
+sequenceDiagram
+    participant EventConsumer
+    participant Balances
+    participant DTOPersist
+    participant PrimaryDB
+    participant SecondaryDB
+
+    EventConsumer->>Balances: deliver balance events
+    Balances->>DTOPersist: send balance DTO
+    DTOPersist->>PrimaryDB: persist balance
+    DTOPersist->>SecondaryDB: persist balance
+```
+
+3. Fallback via Conciliator:
+```mermaid
+sequenceDiagram
+    participant DTOComposer
+    participant DTOFallback
+    participant EventGenerator
+    participant EventBroker
+    participant EventConsumer
+    participant Conciliator
+    participant DTOComposer as ReattemptComposer
+
+    DTOComposer->>DTOFallback: send failure context
+    DTOFallback->>EventGenerator: emit conciliatory event
+    EventGenerator->>EventBroker: push event
+    EventConsumer->>Conciliator: pull conciliatory event
+    Conciliator->>EventGenerator: emit resolved event
+    EventGenerator->>EventBroker: push event
+    EventConsumer->>ReattemptComposer: deliver resolved event
+```
+
+4. Mixed functional + balance update:
+```mermaid
+sequenceDiagram
+    participant EventConsumer
+    participant DTOComposer
+    participant Balances
+    participant DTOPersist
+    participant PrimaryDB
+    participant SecondaryDB
+
+    EventConsumer->>DTOComposer: deliver functional events
+    EventConsumer->>Balances: deliver balance events
+    DTOComposer->>DTOPersist: partial DTO
+    Balances->>DTOPersist: balance data
+    DTOPersist->>PrimaryDB: persist full DTO
+    DTOPersist->>SecondaryDB: persist full DTO
+```
