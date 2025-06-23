@@ -1,0 +1,19 @@
+
+Figura 3. Solución con Middleware DTO
+
+Descripción general
+Esta figura presenta el modelo propuesto que introduce el componente DTO Middleware como solución funcional al problema identificado previamente. El enfoque central de esta arquitectura es la generación y mantenimiento de objetos de transferencia de datos (DTOs) unificados y estandarizados (por ejemplo, Customer Position), que consolidan múltiples fuentes de información bajo una estructura alineada al marco BIAN.
+
+El Middleware se encarga de generar estos DTOs a partir de eventos técnicos provenientes de distintos sistemas fuente, bases replicadas u otras plataformas de integración. Una vez generados, los objetos son almacenados en dos tipos de repositorios desacoplados:
+- Base de datos de acceso rápido: diseñada para permitir consultas inmediatas, optimizando el tiempo de respuesta para los consumidores. No se considera una caché funcional, sino una instancia de almacenamiento primaria dentro del Middleware.
+- Base de datos persistente: garantiza la durabilidad de los datos, asegurando su recuperación ante fallos en los mecanismos de acceso rápido.
+
+Es importante destacar que esta solución no impone un modelo de caché, sino que proporciona una estructura de almacenamiento dual —una rápida y otra persistente— para responder a distintos niveles de servicio. Cada sistema consumidor (por ejemplo, APIs o subsistemas) puede, si lo desea, implementar su propio mecanismo de almacenamiento intermedio o políticas de TTL, pero esto queda completamente desacoplado del Middleware.
+
+Principales aportaciones
+- Se desacopla completamente la lógica de generación y composición de datos del canal de consumo.
+- El Middleware actúa como generador, validador y mantenedor de los DTOs, liberando a las APIs de lógica de orquestación o acoplamientos con sistemas fuente.
+- Se introducen mecanismos basados en eventos para capturar, componer y actualizar DTOs en tiempo cercano al real (Near Real Time), con posibilidad de consolidación mediante lógica de backpressure.
+- Permite la proyección de solo los datos requeridos por cada consumidor, optimizando el tamaño de las respuestas y el desempeño general.
+- Los consumidores pueden implementar sus propios modelos de almacenamiento o TTL si así lo requieren, sin depender del modelo interno del Middleware.
+- El Middleware puede generar nuevos eventos derivados de las actualizaciones realizadas a los DTOs, habilitando integraciones reactivas o flujos de negocio posteriores.
