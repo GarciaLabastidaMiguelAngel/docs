@@ -1,0 +1,17 @@
+Figura 1 - Escenario tradicional de orquestación desde APIs
+
+Descripción general:
+Esta figura representa el modelo actual bajo el cual muchas plataformas han operado para ofrecer una vista consolidada de la información del cliente. La solución más común ha sido implementar una API que actúa como orquestador, realizando llamadas en línea a diferentes fuentes de datos —como mainframe, bases de datos relacionales, subsistemas legados y otras APIs— con el objetivo de construir dinámicamente la información requerida en tiempo real.
+
+Este enfoque impone una elevada complejidad técnica sobre las APIs, las cuales deben gestionar múltiples integraciones, coordinar respuestas asíncronas, y adaptarse a los distintos formatos y tiempos de respuesta de cada sistema fuente. Además, los canales de atención que consumen estas APIs —como aplicaciones móviles, web y sucursales— se ven directamente impactados en la experiencia del cliente cuando alguna de estas dependencias falla o responde lentamente.
+
+Principales problemáticas:
+- Alta complejidad de orquestación, difícil de escalar o mantener en el tiempo.
+- Fuerte acoplamiento con sistemas legacy que no están optimizados para servir en línea.
+- Latencias elevadas y poco predecibles ante múltiples integraciones simultáneas.
+- Baja resiliencia: un solo fallo en cualquier componente fuente puede comprometer la respuesta.
+- Impacto directo en canales digitales y físicos donde el cliente interactúa en tiempo real con el banco.
+- En procesos batch, la afectación es menos perceptible, pero en tiempo real afecta la experiencia del usuario.
+
+Consideraciones:
+Este patrón no es exclusivo de APIs; otros sistemas internos también presentan esta lógica de orquestación compleja, como se muestra en la caja marcada como “other systems”. Estos sistemas suelen replicar la misma problemática, acoplándose fuertemente a diversas fuentes de datos y quedando limitados en su capacidad de evolución hacia arquitecturas desacopladas.
