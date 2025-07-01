@@ -1,0 +1,85 @@
+
+Descripción General del Diagrama Funcional - API DTO Middleware (Basado en EIP)
+
+Este diagrama representa la arquitectura funcional del middleware encargado de la generación, persistencia y distribución de DTOs (Data Transfer Objects) a partir de eventos consumidos desde diversas fuentes maestras. El flujo se estructura siguiendo patrones de integración EIP (Enterprise Integration Patterns), implementados con herramientas compatibles como Spring Cloud Stream y Spring Integration.
+
+Se identifican cuatro grandes bloques funcionales, todos dentro del componente API DTO Middleware:
+
+1. Event Generator
+2. Event Consumer
+3. DTO Generator (incluyendo Composer, Persist, Fallback, Balances)
+4. Conciliator
+
+Además, se visualizan los subsistemas de soporte como Event Broker, Master Event Sources, y los repositorios de datos DTO Storages.
+
+Componentes Principales y su Función
+
+1. Master Event Sources:
+   - Origen de eventos provenientes de sistemas legacy, bases de datos relacionales (CDC) o sistemas internos.
+   - Envían eventos al Event Broker, que los encapsula para procesamiento posterior.
+
+2. Event Broker:
+   - Actúa como bus de eventos (Kafka), soportando múltiples topics de entrada y salida.
+   - Provee canales asíncronos para que el Event Consumer los consuma con filtros específicos.
+   - Publica eventos compuestos o derivados a través del Event Sender.
+
+3. Event Generator:
+   Subcomponentes:
+   - Event Composer:
+     - Realiza el ensamble de eventos nuevos a partir de los ya procesados.
+     - Aplica filtros, enriquecimiento, composición condicional y transformaciones.
+   - Event Sender:
+     - Publica los eventos generados a Kafka (o el broker configurado).
+     - Puede aplicar lógica de enrutamiento dinámico o prioridad de envío.
+
+4. Event Consumer:
+   Subcomponentes:
+   - Default Filter / Error Filter:
+     - Evalúan condiciones previas al enrutamiento del evento.
+     - En caso de error, dirigen al flujo de fallback correspondiente.
+   - Channel Selector:
+     - Determina dinámicamente qué flujo de composición debe procesar el evento.
+   - Payload Splitter y Formatter:
+     - En algunos escenarios, los eventos pueden ser divididos o reformateados antes de su composición en un DTO.
+
+5. DTO Generator:
+   Subcomponentes:
+   - DTO Composer:
+     - Ensambla el DTO según las reglas del dominio (CustomerPosition, Cards, etc.).
+     - Coordina la consulta de datos complementarios en línea si es requerido.
+   - DTO Persist:
+     - Encargado de escribir el DTO tanto en almacenamiento primario (Redis/RedisJSON) como en persistente (Oracle/Converged JSON).
+     - Aplica política de idempotencia.
+   - DTO Fallback:
+     - Se activa en caso de falla de composición.
+     - Recupera datos de fuentes o eventos anteriores y reintenta composición.
+   - Balances:
+     - Subcomponente especializado para obtener datos de saldos (fuentes legacy).
+     - Puede operar por lógica contable o vía eventos previos si aplica.
+
+6. Conciliator:
+   Subcomponentes:
+   - Default Conciliator:
+     - Gestiona reintentos según configuración (n retries).
+     - Lee eventos marcados como fallidos desde el broker.
+   - Retry Conciliator:
+     - Aplica lógica específica de reconciliación o regeneración del DTO.
+   - Durable Channel (opcional):
+     - Se considera la posibilidad de utilizar una tabla en base de datos para persistir eventos fallidos.
+
+7. DTO Storages:
+   - DTO Cache:
+     - Repositorio primario de lectura rápida (Redis con módulo RedisJSON).
+   - DTO Persist:
+     - Base de datos de almacenamiento persistente (Oracle Converged Database con capacidad JSON).
+
+Aspectos Técnicos Adicionales:
+- Todos los flujos están construidos sobre patrones EIP:
+  Message Channels, Filters, Content Enricher, Message Translator, Aggregator, Splitter, Resequencer, etc.
+- Se utiliza Spring Integration DSL y Spring Cloud Stream como marco de implementación base.
+- El payload de los eventos sigue una estructura basada en customerId, eventType, source, payloadData.
+- El flujo completo permite:
+  - Composición bajo demanda.
+  - Reintentos automáticos.
+  - Generación de nuevos eventos derivados.
+  - Lectura eventual consistente desde repositorio rápido y persistente.
