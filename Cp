@@ -1,0 +1,192 @@
+sequenceDiagram
+    autonumber
+    %% Participants
+    participant Client as API Consumer
+    participant APIC as API Connect (single instance)
+    participant CP as Customer Position MS
+    participant Redis as Redis (Cache)
+    participant MQIN as MQ (Queue IN)
+    participant Host as Mainframe (PS7/DDF)
+    participant MQOUT as MQ (Queue OUT)
+    participant Disp as Message Dispatcher
+    participant INV as Investment MS
+    participant INS as Insurance MS
+    participant AnonymWS as Anonymizer Web Service
+
+    %% ---------- Entry & security ----------
+    Client->>APIC: HTTPS (mTLS) + JWSID (aud=channel) + JSON {customerId}
+    APIC->>APIC: Validate JWSID, mTLS, rate limits
+    APIC->>APIC: Change audience → new JWSID (aud=CP)
+    APIC->>CP: HTTPS + JWSID (aud=CP) + JSON     %% no mTLS
+    CP->>CP: Validate JWSID (own audience)
+
+    %% ---------- Step 1 runs in parallel with 6 & 7 ----------
+    par (1) Products DDF (drives steps 2..5)
+        CP->>Redis: GET ddf:products:tcdtgen-pedt008:{customerId}
+        alt MISS
+            CP->>Host: DDF TCDTGEN ⟕ PEDT008 WHERE customerId=?
+            Host-->>CP: Product list (types/flags)
+            CP->>Redis: SETEX ddf:products:tcdtgen-pedt008:{customerId}, 3600, JSON  %% 1 hour
+        else HIT
+            Redis-->>CP: JSON (cached)
+        end
+        CP->>CP: Derive flags → {hasCards, hasAccounts, hasDeposits, hasLoansMortgage}
+    and (6) Investment (direct, JWSID propagated)
+        CP->>Redis: GET ws:investment:{customerId}
+        alt MISS
+            CP->>INV: HTTPS + JWSID (aud=INV) + JSON   %% no mTLS
+            INV-->>CP: Investment portfolio
+            CP->>Redis: SETEX ws:investment:{customerId}, 600, JSON  %% 10 min cache
+        else HIT
+            Redis-->>CP: JSON (cached)
+        end
+    and (7) Insurance (via same API Connect)
+        CP->>Redis: GET api:insurance:{customerId}
+        alt MISS
+            CP->>APIC: HTTPS + JWSID (aud=INS) + JSON   %% no mTLS on backend hop
+            APIC->>INS: HTTPS + JWSID (aud=INS) + JSON
+            INS-->>APIC: HTTPS 200 + JSON
+            APIC-->>CP: HTTPS 200 + JSON
+            CP->>Redis: SETEX api:insurance:{customerId}, 600, JSON  %% 10 min cache
+        else HIT
+            Redis-->>CP: JSON (cached)
+        end
+    end
+
+    %% ---------- Fan-out: ONLY steps 2..5 depend on step 1 ----------
+    par If hasCards → (2) getCustomerCards  (LMWT paginated)
+        opt hasCards
+            loop while more LMWT pages
+                CP->>Redis: GET trx:lmwt:{customerId}:{page}
+                alt MISS
+                    CP->>CP: corrId = new()
+                    CP->>MQIN: Put(PS7 LMWT [page request], corrId)
+                    MQIN-->>Host: Get LMWT
+                    Host-->>MQOUT: Put(LMWT Page Response, corrId)
+                    MQOUT-->>Disp: Get
+                    Disp-->>CP: Push LMWT Page
+                    CP->>Redis: SETEX trx:lmwt:{customerId}:{page}, 300, JSON  %% 5 min cache
+                else HIT
+                    Redis-->>CP: JSON (cached)
+                end
+
+                %% ITEM LOOP per card in this page -> 2.1 / 2.2 / 2.3 in parallel
+                loop for each card in page
+                    par (2.1) Card Anonymization (cacheable)
+                        CP->>Redis: GET ws:anonymization:{cardId}
+                        alt MISS
+                            CP->>AnonymWS: HTTPS request (cardId)
+                            AnonymWS-->>CP: Anonymized data
+                            CP->>Redis: SETEX ws:anonymization:{cardId}, 3600, JSON  %% 1 hour cache
+                        else HIT
+                            Redis-->>CP: JSON (cached)
+                        end
+                    and (2.2) Card Balance (no cache)
+                        CP->>CP: corrId = new()
+                        CP->>MQIN: Put(PS7 LMWG, corrId)
+                        MQIN-->>Host: Get LMWG
+                        Host-->>MQOUT: Put(LMWG Response, corrId)
+                        MQOUT-->>Disp: Get
+                        Disp-->>CP: Push Card Balance
+                    and (2.3) Warnings & Blocks (no cache)
+                        CP->>Host: DDF BGDTCOB (cardId)
+                        Host-->>CP: Warnings/Blocks
+                    end
+                end
+            end
+        end
+    and If hasAccounts → (3) getCustomerAccounts  (LZCF paginated - accounts mode)
+        opt hasAccounts
+            loop while more LZCF[accounts] pages
+                CP->>Redis: GET trx:lzcf:accounts:{customerId}:{page}
+                alt MISS
+                    CP->>CP: corrId = new()
+                    CP->>MQIN: Put(PS7 LZCF [accounts page], corrId)
+                    MQIN-->>Host: Get LZCF [accounts]
+                    Host-->>MQOUT: Put(LZCF Accounts Page, corrId)
+                    MQOUT-->>Disp: Get
+                    Disp-->>CP: Push Accounts Page
+                    CP->>Redis: SETEX trx:lzcf:accounts:{customerId}:{page}, 300, JSON  %% 5 min cache
+                else HIT
+                    Redis-->>CP: JSON (cached)
+                end
+            end
+        end
+    and If hasDeposits → (4) getCustomerDeposits  (LZCF paginated - deposits mode)
+        opt hasDeposits
+            loop while more LZCF[deposits] pages
+                CP->>Redis: GET trx:lzcf:deposits:{customerId}:{page}
+                alt MISS
+                    CP->>CP: corrId = new()
+                    CP->>MQIN: Put(PS7 LZCF [deposits page], corrId)
+                    MQIN-->>Host: Get LZCF [deposits]
+                    Host-->>MQOUT: Put(LZCF Deposits Page, corrId)
+                    MQOUT-->>Disp: Get
+                    Disp-->>CP: Push Deposits Page
+                    CP->>Redis: SETEX trx:lzcf:deposits:{customerId}:{page}, 300, JSON
+                else HIT
+                    Redis-->>CP: JSON (cached)
+                end
+
+                %% ITEM LOOP per deposit -> 4.1 in parallel
+                loop for each deposit in page
+                    par (4.1) Deposit REVN sequence (cacheable)
+                        CP->>Redis: GET ddf:bgdtipf:{depositId}
+                        alt MISS
+                            CP->>Host: DDF BGDTIPF (depositId)
+                            Host-->>CP: REVN sequence
+                            CP->>Redis: SETEX ddf:bgdtipf:{depositId}, 600, JSON  %% 10 min cache
+                        else HIT
+                            Redis-->>CP: JSON (cached)
+                        end
+                    end
+                end
+            end
+        end
+    and If hasLoansMortgage → (5) getCustomerLoansAndMortgage  (PSA1 paginated)
+        opt hasLoansMortgage
+            loop while more PSA1 pages
+                CP->>Redis: GET trx:psa1:{customerId}:{page}
+                alt MISS
+                    CP->>CP: corrId = new()
+                    CP->>MQIN: Put(PS7 PSA1 [page request], corrId)
+                    MQIN-->>Host: Get PSA1
+                    Host-->>MQOUT: Put(PSA1 Page Response, corrId)
+                    MQOUT-->>Disp: Get
+                    Disp-->>CP: Push PSA1 Page
+                    CP->>Redis: SETEX trx:psa1:{customerId}:{page}, 300, JSON  %% 5 min cache
+                else HIT
+                    Redis-->>CP: JSON (cached)
+                end
+
+                %% ITEM LOOP per loan/mortgage -> 5.1 in parallel
+                loop for each loan/mortgage in page
+                    par (5.1) Loan/Mortgage Participant (cacheable)
+                        CP->>Redis: GET trx:psa2:{loanId}
+                        alt MISS
+                            CP->>CP: corrId = new()
+                            CP->>MQIN: Put(PS7 PSA2, corrId)
+                            MQIN-->>Host: Get PSA2
+                            Host-->>MQOUT: Put(PSA2 Response, corrId)
+                            MQOUT-->>Disp: Get
+                            Disp-->>CP: Push Participant
+                            CP->>Redis: SETEX trx:psa2:{loanId}, 600, JSON  %% 10 min cache
+                        else HIT
+                            Redis-->>CP: JSON (cached)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    %% ---------- Aggregate & respond ----------
+    CP->>CP: Aggregate results (2..5 + 6 + 7) → DTO → JSON
+    CP-->>APIC: HTTPS 200 + JSON
+    APIC-->>Client: HTTPS (mTLS) 200 + JSON
+
+    %% ---------- Notes ----------
+    note over Client,APIC: Only this hop uses mTLS.
+    note over APIC,CP,INS: No mTLS from API Connect to microservices.
+    note over CP,INV: Direct CP→Investment with JWSID propagation (no mTLS).
+    note over CP,Host: PS7 for TRX (LMWT, LMWG, LZCF, PSA1/PSA2); DDF for products and per-item lookups (TCDTGEN⟕PEDT008, BGDTCOB, BGDTIPF).
