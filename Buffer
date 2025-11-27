@@ -1,0 +1,150 @@
+7.x Estrategia de Solución — Integración de Autenticación y Single Sign-On (OIDC + SAML 2.0)
+
+La presente sección describe, de manera exhaustiva y con enfoque arquitectónico, la estrategia de autenticación que habilita la integración de la aplicación Commercial Cards dentro del portal BET. Esta integración debe asegurar que el usuario pueda navegar desde el entorno institucional del banco hacia la solución desplegada en AWS sin realizar autenticaciones adicionales, preservando la sesión ya establecida, cumpliendo estándares de seguridad y alineándose a la arquitectura multicomponente que involucra BET, Transmit y Amazon Cognito.
+
+El objetivo fundamental consiste en federar la sesión autenticada en BET hacia Transmit mediante el uso de SAML 2.0 y, posteriormente, permitir que Transmit complete el flujo de OpenID Connect (OIDC) requerido por Cognito. Con ello, la aplicación Commercial Cards puede operar autenticada bajo un esquema de seguridad moderno, manteniendo el control institucional de la autenticación original y asegurando coherencia en la experiencia del usuario.
+
+-------------------------------------------------------------------------------
+7.x.1 Visión General del Modelo de Autenticación
+-------------------------------------------------------------------------------
+
+En el estado actual, BET continúa siendo el punto de autenticación primario para los clientes corporativos. Su modelo de autenticación, aunque legacy, sigue siendo la referencia institucional para validar la identidad del usuario. Este documento plantea un mecanismo cuidadosamente diseñado para que esta identidad pueda ser proyectada hacia Transmit, sin exponer credenciales ni alterar la forma en que BET administra sus sesiones.
+
+Una vez que el usuario accede al portal BET y se autentica, el sistema muestra la opción de ingresar a Commercial Cards únicamente si ese cliente se encuentra autorizado para su uso. Al seleccionar esta opción, el navegador del usuario deberá cargar la SPA de Commercial Cards. Dicha SPA inicia automáticamente un flujo OIDC hacia Amazon Cognito, quien funge como Authorization Server de la solución en AWS. Como parte de la configuración de federación, Cognito no autentica directamente al usuario, sino que delega la autenticación en Transmit.
+
+Transmit, al recibir la petición, necesita determinar si el usuario ya tiene una sesión válida. Como Transmit no autentica directamente al usuario en este flujo, debe validar con BET que la sesión existe y que el usuario está autenticado. BET, por su parte, expone un mecanismo basado en SAML 2.0 para permitir esta verificación con el mínimo intercambio de información sensible y de forma totalmente alineada al estándar.
+
+A partir de esta sincronización, Transmit puede continuar el flujo OIDC hacia Cognito sin requerir ningún tipo de interacción adicional del usuario. De este modo, el usuario accede a Commercial Cards sin necesidad de proporcionar credenciales nuevamente, logrando una experiencia fluida y confiable.
+
+-------------------------------------------------------------------------------
+7.x.2 Uso de SAML 2.0 como Mecanismo de Federación entre BET y Transmit
+-------------------------------------------------------------------------------
+
+El estándar SAML 2.0 Web Browser SSO es utilizado como mecanismo formal para que Transmit pueda validar una sesión previamente establecida en BET. Esta integración no busca convertir a BET en un IdP moderno, sino dotarlo de la funcionalidad mínima requerida para emitir afirmaciones de autenticación válidas ante Transmit.
+
+Aunque en este documento se describe como un “mecanismo ligero”, es fundamental precisar que:
+
+Se implementan únicamente los elementos necesarios para la federación, pero sin abandonar el cumplimiento estricto del estándar SAML 2.0. El término “ligero” refiere al alcance mínimo, no a una simplificación del protocolo.
+
+El flujo funciona de la siguiente forma:
+
+1. Transmit genera un SAML AuthnRequest dirigido a BET.
+2. BET detecta la existencia de una sesión válida.
+3. BET construye un SAML Response firmado que incluye:
+   - Identificador único del usuario autenticado.
+   - Identificador de la sesión activa de BET.
+   - Método de autenticación utilizado (password + MFA o sesión previa).
+   - Bandera que indica autorización de uso de Commercial Cards.
+4. BET retorna este Response hacia Transmit utilizando las normas de redireccionamiento SAML (HTTP POST/Redirect).
+5. Transmit valida:
+   - las firmas,
+   - la integridad de la respuesta,
+   - la vigencia de la afirmación SAML,
+   - la autorización para operar con Commercial Cards.
+6. Una vez validado, Transmit establece o confirma su propia sesión interna y continúa el flujo OIDC.
+
+Este modelo garantiza que BET mantenga control de la autenticación original y que Transmit únicamente opere como un federador que necesita recibir afirmaciones verificables. No se transmiten roles ni atributos adicionales, ya que estos se administrarán posteriormente en la arquitectura de Commercial Cards mediante mecanismos propios de la plataforma.
+
+-------------------------------------------------------------------------------
+7.x.3 Flujo OIDC entre Transmit y Amazon Cognito
+-------------------------------------------------------------------------------
+
+Una vez completada con éxito la federación SAML, Transmit está en condiciones de continuar con el flujo OIDC hacia Cognito. En este punto, Transmit actúa como proveedor de identidad federado, devolviendo a Cognito los artefactos necesarios para completar el Authorization Code Flow.
+
+El flujo consiste en los pasos siguientes:
+
+1. La SPA de Commercial Cards inicia el Authorization Code Flow contra Cognito.
+2. Cognito identifica que el usuario debe autenticarse mediante Transmit.
+3. Cognito redirige al navegador hacia el endpoint de autorización de Transmit.
+4. Transmit determina:
+   - Si tiene una sesión propia vigente, continúa.
+   - Si no tiene sesión, ejecuta el proceso SAML hacia BET.
+5. Transmit genera un authorization code y redirige de vuelta hacia Cognito.
+6. Cognito intercambia el código por los tokens correspondientes:
+   - ID Token (con claims que identifican al usuario).
+   - Access Token (para permitir el acceso a servicios de AWS).
+   - Refresh Token (si se ha configurado).
+7. La SPA recupera los tokens y continúa su ejecución autenticada.
+
+El proceso se apega estrictamente al estándar OIDC, lo que garantiza plena compatibilidad con los componentes de AWS involucrados y asegura que la autenticación se realice con mecanismos modernos con los cuales la infraestructura de Commercial Cards ya se encuentra alineada.
+
+-------------------------------------------------------------------------------
+7.x.4 Objetivos de la Estrategia de Autenticación
+-------------------------------------------------------------------------------
+
+La integración de autenticación tiene los siguientes objetivos:
+
+- Permitir que el usuario acceda a Commercial Cards sin autenticaciones adicionales.
+- Preservar y proyectar la sesión original del usuario en BET.
+- Utilizar exclusivamente SAML 2.0 y OpenID Connect como protocolos de federación, evitando enfoques propietarios.
+- Asegurar la interoperabilidad entre sistemas legacy y plataformas modernas.
+- Minimizar los cambios en BET, manteniendo su rol institucional como punto de autenticación inicial.
+- Facilitar la gobernanza institucional de seguridad, evitando la duplicación de credenciales y puntos de autenticación.
+- Alinear la experiencia de usuario en todo el flujo, garantizando coherencia y simplicidad.
+
+-------------------------------------------------------------------------------
+7.x.5 Consideraciones de Seguridad y Control
+-------------------------------------------------------------------------------
+
+La solución está diseñada con un enfoque de seguridad end-to-end:
+
+- Todo el tráfico SAML y OIDC viaja por canales HTTPS.
+- Las cookies HTTP-only de Cognito, Transmit y BET son manejadas exclusivamente por sus respectivos endpoints.
+- BET no expone ni comparte contraseñas ni factores; solamente afirma la autenticación.
+- Transmit no almacena credenciales del usuario; solo federación.
+- Cognito genera tokens OIDC con vigencias controladas.
+- La sesión del usuario es consistente entre todos los sistemas que participan.
+
+-------------------------------------------------------------------------------
+7.x.6 Estrategia de Logout Integrado (Cognito + Transmit + BET)
+-------------------------------------------------------------------------------
+
+El proceso de logout requiere el mismo nivel de integridad y coordinación que el proceso de autenticación. La sesión debe finalizar completamente en los sistemas involucrados para evitar que el usuario quede autenticado parcialmente.
+
+El proceso inicia en Commercial Cards y progresa hacia Cognito, luego a Transmit, y finalmente a BET.
+
+-------------------------------------------------------------------------------
+7.x.6.1 Principios del Logout
+-------------------------------------------------------------------------------
+
+- Debe finalizar toda sesión activa en todos los sistemas.
+- Las cookies se eliminan exclusivamente mediante los endpoints propios.
+- La SPA no manipula cookies HTTP-only.
+- La secuencia debe garantizar la coherencia de la sesión.
+
+-------------------------------------------------------------------------------
+7.x.6.2 Flujo de Logout
+-------------------------------------------------------------------------------
+
+1. La SPA de Commercial Cards elimina su estado local.
+2. La SPA redirige al endpoint de logout de Cognito.
+3. Cognito invalida la sesión del usuario y redirige hacia Transmit.
+4. Transmit elimina su cookie y sesión interna.
+5. Transmit redirige al endpoint de logout de BET.
+6. BET invalida la sesión legacy institucional.
+
+-------------------------------------------------------------------------------
+7.x.6.3 Consideraciones Finales del Logout
+-------------------------------------------------------------------------------
+
+El cierre se realiza siempre en sentido inverso al de autenticación. Cada sistema participa exclusivamente en su ámbito de control, y una vez finalizado el flujo, no existe ninguna sesión residual en el ecosistema.
+
+-------------------------------------------------------------------------------
+7.x.7 Secuencia Conceptual Consolidada (Autenticación y Logout)
+-------------------------------------------------------------------------------
+
+Autenticación:
+- Usuario inicia sesión en BET.
+- SPA inicia flujo OIDC.
+- Cognito delega hacia Transmit.
+- Transmit valida sesión mediante SAML.
+- BET responde confirmando la sesión.
+- Transmit genera authorization code.
+- Cognito emite tokens.
+- La SPA opera autenticada.
+
+Logout:
+- SPA limpia estado.
+- Cognito invalida sesión.
+- Transmit cierra federación.
+- BET cierra sesión institucional.
