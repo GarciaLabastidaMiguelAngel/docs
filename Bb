@@ -1,0 +1,137 @@
+Perfecto.
+Aquí tienes tu Building Block Whitebox exactamente en formato ARC-42, usando la estructura correcta (Purpose, Responsibilities, Interfaces, Internal Structure, Variantes, Quality & Risks).
+Ya está redactado para pegar directamente en tu sección “Building Block View – Whitebox: Autenticación Federada (SAML 2.0 ↔ OIDC)”.
+
+⸻
+
+7.x Whitebox: Autenticación Federada (SAML 2.0 ↔ OIDC)
+
+(ARC-42 – Building Block View)
+
+7.x.1 Propósito
+
+Este building block implementa el mecanismo de federación de identidad entre el portal BET y la plataforma Commercial Cards. Su función principal es permitir que un usuario autenticado en BET pueda acceder a Commercial Cards sin exponer credenciales y sin ejecutar un segundo proceso de login.
+
+El componente integra interoperabilidad entre tres dominios de identidad distintos:
+	•	BET: autenticación legacy basada en sesión utilizando SAML 2.0 como Service Provider (SP).
+	•	Transmit Security: federador/Proxy IdP entre SAML y OIDC.
+	•	AWS Cognito: servidor de autorización OIDC para la aplicación Commercial Cards.
+
+Este whitebox describe cómo se orquestan estos elementos, la secuencia de intercambio de mensajes y los artefactos resultantes (SAMLResponse, authorization code, tokens OIDC).
+
+⸻
+
+7.x.2 Responsabilidades
+
+Responsabilidades del Building Block
+	•	Federar la sesión autenticada en BET a Commercial Cards mediante SAML 2.0 → OIDC.
+	•	Mantener claramente separadas las responsabilidades de autenticación y autorización.
+	•	Garantizar que BET no se modifica ni expone credenciales; únicamente afirma autenticación.
+	•	Centralizar la federación en Transmit Security como componente de enlace.
+	•	Permitir que Cognito ejecute el flujo OIDC Authorization Code y emita tokens seguros.
+	•	Asegurar la propagación del contexto autenticado hacia la SPA de Commercial Cards.
+	•	Garantizar que las cookies (JSESSIONID, TS_SESSION) se mantengan en el navegador y no sean accesibles por la SPA.
+
+Fuera de alcance
+	•	Cambios en el login interno de BET.
+	•	Emisión de tokens JWT desde BET.
+	•	Gestión de roles o políticas de acceso internas de Commercial Cards.
+	•	Registro o persistencia de identidad en Transmit o Cognito.
+	•	Manejo de tokens para llamadas internas de APIs (otro building block).
+
+⸻
+
+7.x.3 Interfaces del Componente
+
+Entradas
+	•	OIDC Authorization Request — generado por Cognito.
+	•	SAMLRequest — generado por Transmit Security hacia BET.
+	•	Solicitud de tokens OIDC — iniciada por la SPA mediante intercambio de authorization code.
+
+Salidas
+	•	SAMLResponse — emitida por BET a Transmit.
+	•	OIDC Authorization Code — emitido por Transmit a Cognito.
+	•	ID Token / Access Token OIDC — emitidos por Cognito hacia la SPA.
+	•	Cookies de sesión:
+	•	JSESSIONID (BET)
+	•	TS_SESSION (Transmit Security)
+
+Protocolos
+	•	SAML 2.0 (HTTP-POST binding, RelayState).
+	•	OIDC Authorization Code Flow + PKCE.
+	•	HTTPS/TLS 1.2+.
+
+⸻
+
+7.x.4 Estructura Interna (Whitebox)
+
+El building block está compuesto por cuatro elementos internos principales:
+
+(1) Middleware BET – SAML 2.0 SP
+	•	Expone endpoint SAML SP para federación.
+	•	Confirma autenticación mediante SAMLResponse basada en la sesión local existente.
+	•	No genera tokens ni mantiene estado adicional.
+
+(2) Transmit Security – Proxy / Federation Broker
+	•	Gestiona la federación entre SAML y OIDC.
+	•	Recibe el SAMLResponse y crea su sesión (TS_SESSION).
+	•	Reanuda el flujo OIDC original entregando el authorization code a Cognito.
+	•	Mantiene relación entre RelayState y la request original.
+
+(3) AWS Cognito – OIDC Authorization Server
+	•	Inicia el flujo OIDC y redirige a Transmit Security como IdP federado.
+	•	Valida authorization code y entrega tokens OIDC al navegador.
+	•	Mantiene sesiones internas para la SPA de Commercial Cards.
+
+(4) Navegador del usuario (JSP Host + SPA Commercial Cards)
+	•	Hospeda el contenedor JSP de BET y la SPA Angular de Commercial Cards.
+	•	Mantiene cookies HttpOnly/secure para BET y Transmit.
+	•	Gestiona redirecciones automáticas SAML y OIDC sin exponer secretos.
+
+⸻
+
+7.x.5 Flujo de Mensajes Interno (derivado del diagrama whitebox)
+	1.	La SPA solicita autorización a Cognito (no hay tokens vigentes).
+	2.	Cognito inicia un OIDC Authorization Request y redirige al navegador.
+	3.	Cognito delega autenticación hacia Transmit Security (IdP federado).
+	4.	Transmit genera un SAMLRequest y redirige hacia BET.
+	5.	BET construye SAMLResponse apoyándose en la sesión ‘JSESSIONID’.
+	6.	Transmit valida la SAMLResponse y crea ‘TS_SESSION’.
+	7.	Transmit devuelve a Cognito un OIDC authorization code.
+	8.	La SPA intercambia el authorization code por tokens OIDC.
+	9.	Commercial Cards inicia su sesión con los tokens obtenidos.
+
+⸻
+
+7.x.6 Motivaciones y Decisiones Arquitectónicas
+	•	Se mantiene el login actual de BET para evitar modificación del middleware.
+	•	Se utiliza Transmit como federador para conservar separación entre SAML y OIDC.
+	•	Se evita exposición de credenciales y tokens en el navegador.
+	•	Se adopta Cognito como IdP final para garantizar integración nativa con AWS.
+	•	Se facilita una migración futura hacia un modelo totalmente OIDC sin afectar a BET.
+
+⸻
+
+7.x.7 Calidad y Riesgos
+
+Contribuciones a la calidad
+	•	Seguridad reforzada mediante cookies HttpOnly y TLS.
+	•	No se almacenan credenciales en el navegador.
+	•	Cumple estándares corporativos de identidad.
+	•	Garantiza interoperabilidad entre tecnologías heterogéneas.
+
+Riesgos identificados
+	•	Errores en sincronía RelayState pueden interrumpir el flujo.
+	•	Dependencia explícita en Transmit Security como único federador.
+	•	Tokens OIDC deben estar correctamente validados por Commercial Cards.
+	•	Requiere configuración coordinada de metadatos SAML y OIDC en tres plataformas.
+
+⸻
+
+Si quieres también te genero:
+
+✅ el Blackbox correspondiente,
+✅ la tabla detallada de interfaces (I/O) para este whitebox,
+✅ la versión “copy-paste” para Confluence,
+o
+✅ el diagrama en Mermaid que ARC-42 recomienda.
