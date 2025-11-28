@@ -1,0 +1,24 @@
+Perfecto. Con este whitebox final, te dejo el texto completo, sólido y listo para pegar en la sección de Building Block View (ARC-42).
+Lo redacté siguiendo estilo bancario, tono técnico, sin adornos innecesarios y perfectamente alineado al diagrama que tú definiste.
+
+⸻
+
+Building Block – Componente de Autenticación Federada (SAML 2.0 + OIDC)
+
+1. Propósito del Componente
+
+El componente de Autenticación Federada habilita la integración entre el portal BET y la plataforma Commercial Cards mediante un mecanismo híbrido de SAML 2.0 y OIDC Authorization Code Flow.
+Su objetivo es permitir que un usuario autenticado en BET pueda acceder a la SPA de Commercial Cards sin reenviar credenciales ni duplicar autenticaciones, preservando la sesión existente y cumpliendo con los estándares corporativos de seguridad.
+
+El componente actúa como puente entre tres dominios tecnológicos distintos:
+	•	BET: autenticación legacy basada en sesión (SAML 2.0 SP ligero).
+	•	Transmit Security: federación en modalidad broker SAML ↔ OIDC.
+	•	AWS Cognito: servidor de autorización OIDC de Commercial Cards.
+
+⸻
+
+2. Elementos Principales del Building Block
+
+2.1 BET – Middleware (SAML 2.0 Service Provider Ligero)
+	•	Expone un endpoint SAML para atender solicitudes de federación iniciadas por Transmit Security.
+	•	Utiliza su propio modelo de autenticación local (sesión aplicativa con `JSESSIONID
