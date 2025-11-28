@@ -1,0 +1,99 @@
+Perfecto, aquí te dejo la redacción completa, continua, sin cortes, para la sección Estrategia de Solución – Consumo de APIs GLUON, alineada al estilo que ya estás usando en Confluence y consistente con tu arquitectura.
+
+La redacción es formal, técnica, clara, sin exageraciones y sin usar el término “institucional”, tal como me pediste.
+
+Puedes copiar y pegar directo.
+
+⸻
+
+**Estrategia de Solución
+
+Consumo de APIs GLUON (Modelo de Integración Backend-to-Backend)**
+
+La integración con los sistemas corporativos del banco se basa en el consumo de APIs expuestas en la plataforma GLUON, que funciona como el catálogo centralizado de servicios internos utilizados por las distintas soluciones del ecosistema. Para habilitar esta comunicación desde Comercial Cards, se implementa un modelo de intercambio backend-to-backend, asegurando que todas las invocaciones desde la nube hacia el Core se realicen mediante canales privados, autenticados y controlados.
+
+El objetivo de esta estrategia es garantizar que el backend de Comercial Cards pueda consultar información relevante del cliente, productos, transacciones o datos operativos que residen en dominios internos, sin exponer servicios hacia Internet ni depender de mecanismos inseguros. Todas las comunicaciones se realizan mediante AWS Direct Connect, utilizando un Private VIF que conecta directamente la VPC de PLARD con la red interna del banco.
+
+⸻
+
+1. Mecanismo de autorización hacia GLUON (JWSID)
+
+Para consumir las APIs internas, el backend de Comercial Cards genera un token propietario denominado JWSID, el cual encapsula información de autorización para el consumo de servicios GLUON. Este token se emite en el backend de AWS posterior a la validación del authorization_code en Amazon Cognito.
+
+El flujo es el siguiente:
+	1.	El backend valida el authorization_code recibido desde Cognito.
+	2.	Una vez validado, el backend obtiene el contexto del usuario (ID, atributos y país/empresa).
+	3.	El backend genera un JWSID firmado con un set de claims específicos para GLUON.
+	4.	El token se envía como encabezado en cada invocación hacia APIs internas.
+
+Este JWSID permite que GLUON pueda autorizar y trazar correctamente las peticiones, asociando cada solicitud con el usuario, empresa y sesión activa, sin exponer tokens públicos ni información sensible.
+
+⸻
+
+2. Canal de comunicación seguro y privado
+
+Los servicios GLUON solo son accesibles desde la red interna del banco. Por ello, la solución utiliza:
+	•	AWS Direct Connect
+	•	Private VIF
+	•	Rutas internas mediante el Santander Gateway
+	•	Segmentación basada en intranet
+
+El API Gateway de PLARD se conecta mediante VPC Link hacia los microservicios internos, los cuales a su vez enrutan el tráfico hacia GLUON a través de Direct Connect. Esto evita el uso de túneles VPN y elimina la exposición pública de endpoints.
+
+⸻
+
+3. Modelo de consumo desde EKS y Lambdas
+
+El backend de Comercial Cards está compuesto por:
+	•	Funciones Lambda (lógica transaccional, seguridad y tokenización).
+	•	Servicios desplegados en EKS (dominios PCI y No-PCI).
+
+Ambos tipos de componentes pueden invocar servicios GLUON según lo requiera la lógica de negocio. El modelo se define así:
+	•	Operaciones de uso intensivo, persistencia, consulta de tarjetas y procesos sensibles → EKS
+	•	Operaciones ligeras, token exchange, introspección de permisos, emisión de JWSID → Lambdas
+
+Ambos entornos comparten el mismo mecanismo de autenticación y enrutan hacia GLUON mediante el mismo canal seguro interno.
+
+⸻
+
+4. Validaciones adicionales en Middleware BET
+
+El middleware de BET, desplegado en WAS, también tiene capacidad para consumir transacciones específicas hacia GLUON que permiten determinar, desde el login, si el cliente es elegible para visualizar la opción de Commercial Cards. Esta validación se realiza previo a que el usuario alcance la SPA alojada en AWS, garantizando:
+	•	No exponer rutas a usuarios no habilitados.
+	•	Reducir llamadas innecesarias hacia la nube.
+	•	Mantener la lógica de visibilidad bajo control del banco.
+
+El middleware puede realizar esta consulta de manera síncrona durante el proceso de autenticación del usuario en BET.
+
+⸻
+
+5. Trazabilidad y gobierno
+
+Todo el consumo de APIs GLUON se integra con los mecanismos existentes de:
+	•	Trazabilidad corporativa
+	•	Auditoría interna
+	•	Bitácoras centralizadas
+	•	Control de acceso basado en dominios corporativos
+
+El uso de JWSID permite asociar cada consumo al usuario final autenticado, mientras que la red privada garantiza que el tráfico no abandone el perímetro controlado del banco.
+
+⸻
+
+6. Principales beneficios de este modelo
+	•	Comunicación 100% privada, sin exposición pública.
+	•	Reutilización de la infraestructura GLUON existente.
+	•	Compatibilidad con las políticas actuales del banco.
+	•	Emisión controlada del JWSID desde el backend cloud.
+	•	Coherencia entre el perfil almacenado en Cognito y los servicios corporativos.
+	•	Flexibilidad para crecer el catálogo de APIs consumidas sin cambios estructurales.
+
+⸻
+
+Si quieres, puedo ahora escribir:
+
+✅ La sección completa de estrategia de solución para integración con eventos Kafka
+✅ La sección de estrategia de solución para enrolamiento (Integration Services)
+✅ La sección de estrategia de solución para gobernabilidad, monitoreo y observabilidad
+✅ O la sección completa de end-to-end solution design
+
+Dime cuál sigue.
