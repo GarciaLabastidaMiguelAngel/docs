@@ -1,0 +1,156 @@
+Perfecto, aquí tienes todo el texto en un solo bloque, completamente continuo, sin cortes, sin encabezados duplicados, y listo para copiar/pegar directamente en tu ARC-42.
+
+⸻
+
+CONTEXTO TÉCNICO — VERSIÓN EXTENDIDA (UN SOLO BLOQUE)
+
+El siguiente contexto técnico describe, de manera integral, todos los componentes, dominios y flujos involucrados en la integración de la solución Commercial Cards (CC) con la arquitectura actual del banco, considerando tanto la capa on-premise (BET, Core Gravity, Kafka, IoC, APIs GLUON, infraestructura DMZ/Back) como la capa desplegada en AWS (PLARD Account, VPCs, Cognito, API Gateway, CloudFront, Lambdas, EKS). Este contexto sirve como marco de referencia para entender cómo se comunican los sistemas, qué capacidades existen hoy y qué puntos de integración habilitan el diseño propuesto.
+
+⸻
+
+1. Panorama general
+
+La solución Commercial Cards se desplegará en la infraestructura cloud del banco, bajo la cuenta AWS denominada PLARD, la cual contiene todos los elementos necesarios para ejecutar el frontal, el backend y el mecanismo de autenticación y autorización basado en Amazon Cognito. Esta aplicación se integrará con el portal web BET, una aplicación legacy construida sobre WebSphere (WAS) que actualmente atiende a clientes Pymes y Corporativos del banco. BET es responsable de la autenticación inicial del cliente mediante su propio login y sesionador local, y es el punto de entrada desde el cual el usuario accede a Commercial Cards.
+
+El acceso desde BET hacia la solución en AWS se realiza mediante un flujo de OIDC orquestado por Cognito, pero que depende de un proceso intermedio de “federación ligera” basado en SAML 2.0, implementado entre BET y Transmit Security, con el objetivo de que Transmit pueda validar si existe sesión previa en BET y generar el contexto de federación requerido por Cognito. Aunque el SAML es “ligero”, cumple completamente con el protocolo y sus normativas; simplemente su alcance está enfocado a soportar el mínimo necesario para habilitar el Single Sign-On sin incorporar todo el stack de un Identity Provider completo.
+
+⸻
+
+2. Dominio BET (on-premise)
+
+BET es un portal legacy que opera en WAS 8.x, utilizando JSPs, controladores tradicionales y un modelo de sesión local administrado mediante su propio repositorio Redis. Cuando un cliente se autentica en BET, se genera un ID de sesión cuyo valor es persistido en Redis y que se entrega al navegador mediante una cookie BETSESSIONID.
+
+Esta sesión es relevante porque:
+	1.	Determina si el cliente está autenticado.
+	2.	Permite que Transmit valide —vía consulta posterior— si existe sesión válida sin pedir nuevamente credenciales.
+	3.	Permite que BET determine si el cliente es elegible para visualizar la opción “Commercial Cards”.
+
+La elegibilidad ya no se obtiene del LDAP, sino que se determina consultando el Core Gravity, donde reside el registro maestro del cliente y donde se mantiene la bandera que indica si un cliente tiene acceso habilitado a Commercial Cards. Esta bandera puede ser consultada por BET en el momento del login, permitiendo habilitar o no la opción en el menú.
+
+BET además actúa como contenedor del micro-frontend de Commercial Cards. Esto se logra mediante un JSP que contiene un div donde se incrusta la SPA proveniente de CloudFront, además de lógica previa que almacena atributos en sessionStorage del navegador (CompanyID, lenguaje, país y parámetros de experiencia), necesarios para que la SPA pueda inicializar correctamente su contexto de presentación antes de comenzar.
+
+⸻
+
+3. Dominio Core Gravity (on-premise)
+
+El Core Gravity es el sistema central donde se encuentran los datos fundamentales del cliente corporativo. Allí reside la información que determina si un cliente es elegible para usar Commercial Cards. Gravity opera sobre una base Oracle Exadata, la cual utiliza Oracle GoldenGate para replicar información hacia la plataforma de eventos. Esto se realiza mediante un conjunto de procesos de replicación:
+	•	Push de datos desde Exadata hacia GoldenGate.
+	•	GoldenGate publica los cambios hacia Kafka, en el Cluster C de eventos.
+
+Los datos que viajan hacia Kafka incluyen información relacionada con la activación, modificaciones o desactivación de clientes elegibles para Commercial Cards, lo cual habilita la sincronización automática con Cognito mediante servicios del dominio de integración (descrito más adelante).
+
+⸻
+
+4. Plataforma de eventos (Kafka, Cluster C)
+
+El Cluster C de Kafka es el punto central para distribuir eventos relacionados con cambios de perfilamiento, alta, baja o ajustes en la habilitación de Commercial Cards. Estos eventos son consumidos por dos microservicios clave desplegados en la capa on-premise:
+	•	enrich-event-service
+	•	enroll-service
+
+Ambos conforman el dominio sanmx-commercialcards-integration, encargado de actuar como puente entre el Core Gravity y la plataforma AWS, garantizando que la información de elegibilidad sea propagada de manera consistente hacia Cognito.
+
+El microservicio enroll-service realiza un Push (HTTPs/REST saliente a través de un proxy) hacia servicios expuestos por Commercial Cards en AWS, donde se actualiza el perfil del usuario en Cognito, asegurando que los permisos, banderas o atributos estén sincronizados con la información del Core.
+
+⸻
+
+5. Backoffice IoC (on-premise)
+
+El sistema IoC (I-o-C) permite gestionar aspectos relacionados con usuarios corporativos, incluyendo la configuración de la bandera de acceso a Commercial Cards dentro del dominio Gravity. Cualquier actualización que realice IoC es replicada hacia Kafka mediante GoldenGate, donde los microservicios de integración procesan y reflejan esas actualizaciones en Cognito. IoC forma parte del dominio DMZ-Back (Middleware corporativo WAS con RHEL) y es uno de los componentes que requieren robustecimiento para soportar este modelo de sincronización continua.
+
+⸻
+
+6. APIs GLUON (on-premise)
+
+GLUON (escritura correcta: G-L-U-O-N) es la plataforma de APIs internas del banco. Commercial Cards requiere consumir APIs Core (por ejemplo, datos de tarjetas, estados de cuenta, operaciones corporativas). Para ello, el middleware de Commercial Cards genera un JWSID, un JWT interno que permite autenticación y autorización para consumo de APIs GLUON a través del API Connect Interno. Esta comunicación viaja por el canal intranet, no por internet, mediante un AWS Direct Connect hacia la red interna del banco.
+
+⸻
+
+7. Dominio AWS (PLARD Account)
+
+En AWS se despliega toda la solución comercial:
+
+(a) Red y conectividad)
+La PLARD Account contiene una VPC PCI y otra no-PCI, además de un API Gateway que se encuentra fuera de la VPC (como servicio regional), accediendo a los microservicios mediante VPC Link hacia los subnets privados. La conectividad con el banco se realiza mediante:
+	•	AWS Direct Connect hacia el Santander Gateway.
+	•	Private VIF.
+	•	Rutas en el Transit Gateway y en el Global Network Account.
+
+(b) Frontal (presentación)
+La SPA de Commercial Cards está desplegada en CloudFront, con versiones almacenadas en S3. El flujo OIDC se realiza desde el navegador, que redirecciona a Cognito como Authorization Server y posteriormente vuelve hacia BET con el authorization_code para completar el flujo de autenticación desde el lado de Comercial Cards.
+
+(c) Cognito (autenticación y federación OIDC)
+Cognito actúa como Authorization Server en el flujo OIDC. Cuando un cliente ingresa a Commercial Cards desde BET, Cognito delega automáticamente a Transmit Security como Identity Provider a través de SSO. Para que Transmit determine si debe pedir credenciales o validar sesión previa, Transmit ejecuta un proceso SAML 2.0 ligero con BET.
+
+(d) Backend (Lambdas y EKS)
+El backend de Commercial Cards está compuesto por funciones Lambda para:
+	•	Validar authorization codes.
+	•	Generar opaque tokens.
+	•	Emitir el JWSID hacia GLUON.
+	•	Gestionar operaciones del dominio de tarjetas comerciales.
+	•	Recibir los eventos de enroll-service.
+
+La lógica más compleja del negocio y APIs internas vive en EKS (clusters PCI y No-PCI) con sidecars, balances internos y mTLS.
+
+⸻
+
+8. Transmit Security (flujo SSO ligero SAML 2.0)
+
+Transmit Security funge como proveedor de identidad federado para Cognito, permitiendo que Cognito obtenga el contexto autenticado del cliente sin solicitar credenciales nuevamente. Sin embargo, Transmit no mantiene inicialmente la sesión del cliente. Para ello se ejecuta un flujo basado en:
+	1.	Cognito redirige a Transmit.
+	2.	Transmit detecta que no tiene sesión propia.
+	3.	Transmit ejecuta SAML 2.0 ligero con BET:
+	•	BET recibe un AuthnRequest.
+	•	BET detecta sesión previa.
+	•	BET devuelve un SAML Response firmado.
+	4.	Transmit asocia el SAML Response con la request original (RelayState).
+	5.	Transmit crea su propia sesión (cookie TS_SESSION).
+	6.	Transmit devuelve a Cognito el contexto autenticado.
+
+Todo ello sin exponer credenciales del usuario ni modificar el login de BET.
+
+⸻
+
+9. Interacción completa del flujo desde el navegador
+
+Cuando el cliente entra a BET:
+	1.	Inicia sesión en BET.
+	2.	BET consulta Gravity para determinar elegibilidad.
+	3.	Si es elegible, BET muestra la opción “Commercial Cards”.
+	4.	El usuario hace clic → BET carga el contenedor JSP.
+	5.	El JSP coloca atributos clave en sessionStorage (CompanyID, language, country).
+	6.	La SPA detecta si tiene sesión válida con AWS.
+	7.	Si no tiene sesión válida, inicia el flujo OIDC.
+	8.	Cognito redirige a Transmit.
+	9.	Transmit ejecuta el SAML ligero con BET.
+	10.	Transmit crea sesión propia.
+	11.	Cognito obtiene authorization code.
+	12.	Comercial Cards Backend intercambia el code → obtiene ID token + Access Token.
+	13.	Con el token, la SPA comienza a operar.
+	14.	El backend genera JWSID para invocar APIs GLUON por Direct Connect.
+
+⸻
+
+10. Consideraciones de cierre de sesión
+
+El logout se realiza en cadena:
+	1.	La SPA cierra su sesión local.
+	2.	Se invoca el logout de Cognito.
+	3.	Cognito redirige a Transmit para cierre de sesión.
+	4.	Transmit elimina su cookie interna.
+	5.	(Opcional) BET elimina cookie de sesión si así se decide.
+	6.	El usuario vuelve a BET sin sesión activa en AWS.
+
+⸻
+
+Este contexto técnico establece los cimientos conceptuales y tecnológicos del diseño, anticipando los puntos de integración, los componentes que se robustecen o modifican, y las interacciones entre capas on-premise y AWS necesarias para habilitar Commercial Cards dentro del ecosistema del banco.
+
+⸻
+
+Si quieres, puedo ahora:
+
+✅ Generar una versión más formal y académica
+✅ Generar una versión más ejecutiva y corta
+✅ Insertarlo directamente con formato ARC-42 (sección 3)
+✅ Pasarlo a sección 1, 2 o 4 según la estructura que tú uses
+
+Solo dime qué opción deseas.
