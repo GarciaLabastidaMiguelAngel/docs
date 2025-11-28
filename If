@@ -1,0 +1,45 @@
+ID
+Nombre
+Tipo
+Interfase
+Descripción
+IF-SSO-01
+SAML Authentication Request
+Protocolo
+SAML 2.0 (HTTP-POST / Redirect)
+Solicitud generada por AWS Cognito hacia Transmit Security para iniciar la federación. Incluye los parámetros de autenticación, RelayState y el contexto de la transacción OIDC original.
+IF-SSO-02
+SAML Request (SP-Initiated)
+Protocolo
+SAML 2.0 (HTTP-Redirect)
+Solicitud que Transmit Security envía hacia Middleware BET, actuando como un Proxy IDP. Permite reutilizar la sesión activa de BET sin exponer credenciales del usuario.
+IF-SSO-03
+SAML Assertion
+Protocolo
+SAML 2.0 (HTTP-POST)
+Respuesta autenticada que Middleware BET envía a Transmit Security. Confirma identidad del usuario y permite asociar la autenticación con la sesión TS_SESSION.
+IF-SSO-04
+OIDC Authorization Request
+Protocolo
+OIDC (HTTPS / authorize)
+Solicitud generada por el Browser / Commercial Cards SPA hacia AWS Cognito, para obtener un authorization code mediante la federación configurada con Transmit.
+IF-SSO-05
+OIDC Authorization Code
+Protocolo
+OIDC (HTTPS redirect)
+Código devuelto por AWS Cognito hacia la SPA, representando una autenticación validada vía SAML → Transmit. Se utiliza después en el intercambio de tokens.
+IF-SSO-06
+OIDC Token Request
+Protocolo
+OIDC (HTTPS / token)
+Intercambio realizado por la SPA hacia AWS Cognito, usando el authorization code para obtener: Access Token, ID Token y Refresh Token (según aplique).
+IF-SSO-07
+JSESSIONID (BET)
+Cookie
+HTTP Cookie
+Cookie de sesión emitida por Middleware BET que permite validar internamente la autenticación institucional y generar la SAMLResponse sin pedir credenciales.
+IF-SSO-08
+TS_SESSION (Transmit)
+Cookie
+HTTP Cookie
+Sesión interna de Transmit Security usada para correlacionar: SAMLRequest original, SAMLResponse de BET, y el flujo OIDC hacia Cognito. No almacena tokens ni credenciales.
