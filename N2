@@ -1,0 +1,312 @@
+package com.tuorg.apigate.gate;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.stereotype.Service;
+
+@Service
+public class AccountPriorityGate {
+
+  public enum Priority { ONLINE, BATCH }
+
+  // BIG: separa buckets de prioridad en ZSET
+  private static final long BIG = 1_000_000_000_000L;
+
+  private final RedisTemplate<String, String> redis;
+
+  private final DefaultRedisScript<Long> enqueueOrGo;
+  private final DefaultRedisScript<Long> releaseAndWake;
+  private final DefaultRedisScript<Long> cancel;
+
+  public AccountPriorityGate(RedisTemplate<String, String> redis) {
+    this.redis = redis;
+
+    this.enqueueOrGo = new DefaultRedisScript<>();
+    this.enqueueOrGo.setResultType(Long.class);
+    this.enqueueOrGo.setScriptText(LUA_ENQUEUE_OR_GO_WITH_RQ);
+
+    this.releaseAndWake = new DefaultRedisScript<>();
+    this.releaseAndWake.setResultType(Long.class);
+    this.releaseAndWake.setScriptText(LUA_RELEASE_AND_WAKE_SKIP_ZOMBIES);
+
+    this.cancel = new DefaultRedisScript<>();
+    this.cancel.setResultType(Long.class);
+    this.cancel.setScriptText(LUA_CANCEL_SKIP_ZOMBIES);
+  }
+
+  /**
+   * Adquiere permiso FIFO por cuenta, con prioridad (ONLINE > BATCH).
+   * Síncrono: espera hasta totalWaitTimeout; si vence, hace CANCEL best-effort y lanza excepción.
+   */
+  public Permit acquire(String accountId,
+                        Priority priority,
+                        Duration leaseTtl,
+                        Duration totalWaitTimeout,
+                        Duration waitKeyTtl) {
+
+    final String requestId = UUID.randomUUID().toString();
+
+    final String qKey = queueKey(accountId);
+    final String leaseKey = leaseKey(accountId);
+    final String seqKey = seqKey(accountId);
+    final String waitKey = waitKey(requestId);
+
+    final long prio = (priority == Priority.ONLINE) ? 0L : 1L;
+
+    // Marker TTL: suficiente para cubrir espera + ejecución + margen.
+    // Puedes ajustar el margen según tu core/gateway.
+    final Duration rqTtl = totalWaitTimeout.plus(leaseTtl).plusSeconds(10);
+
+    final long deadlineNanos = System.nanoTime() + totalWaitTimeout.toNanos();
+
+    // 1) Enqueue + si soy head, GO inmediato (atómico)
+    Long go = redis.execute(
+        enqueueOrGo,
+        List.of(qKey, leaseKey, seqKey),
+        requestId,
+        String.valueOf(prio),
+        String.valueOf(BIG),
+        String.valueOf(leaseTtl.toMillis()),
+        String.valueOf(rqTtl.toMillis())
+    );
+
+    if (go != null && go == 1L) {
+      return new Permit(accountId, requestId, leaseTtl, waitKeyTtl);
+    }
+
+    boolean timedOut = false;
+
+    try {
+      // 2) Espera bloqueante (BLPOP), con chunk para recovery y deadline total
+      while (System.nanoTime() < deadlineNanos) {
+
+        Duration remaining = Duration.ofNanos(deadlineNanos - System.nanoTime());
+        Duration chunk = remaining.compareTo(Duration.ofSeconds(2)) > 0 ? Duration.ofSeconds(2) : remaining;
+
+        // BLPOP wait:{requestId} chunk
+        String msg = redis.opsForList().leftPop(waitKey, chunk);
+
+        if ("GO".equals(msg)) {
+          // Validación defensiva: ya debería tener lease porque RELEASE se lo asigna
+          String owner = redis.opsForValue().get(leaseKey);
+          if (requestId.equals(owner)) {
+            return new Permit(accountId, requestId, leaseTtl, waitKeyTtl);
+          }
+        }
+
+        // Recovery raro (wake-up perdido):
+        // Si soy head y el lease está libre, tomo lease.
+        String head = zsetHead(qKey);
+        if (requestId.equals(head)) {
+          Boolean ok = redis.opsForValue().setIfAbsent(leaseKey, requestId, leaseTtl);
+          if (Boolean.TRUE.equals(ok)) {
+            return new Permit(accountId, requestId, leaseTtl, waitKeyTtl);
+          }
+        }
+      }
+
+      timedOut = true;
+      throw new RuntimeException("Timeout esperando turno por cuenta accountId=" + accountId);
+
+    } finally {
+      if (timedOut) {
+        // 3) CANCEL best-effort para no dejar requestId zombie en la cola
+        redis.execute(
+            cancel,
+            List.of(qKey, leaseKey, seqKey),
+            requestId,
+            String.valueOf(leaseTtl.toMillis()),
+            String.valueOf(waitKeyTtl.toMillis())
+        );
+      }
+
+      // cleanup best-effort del buzón; también se borra en CANCEL, pero por si acaso
+      redis.delete(waitKey);
+    }
+  }
+
+  public final class Permit implements AutoCloseable {
+    private final String accountId;
+    private final String requestId;
+    private final Duration leaseTtl;
+    private final Duration waitKeyTtl;
+    private boolean released = false;
+
+    Permit(String accountId, String requestId, Duration leaseTtl, Duration waitKeyTtl) {
+      this.accountId = accountId;
+      this.requestId = requestId;
+      this.leaseTtl = leaseTtl;
+      this.waitKeyTtl = waitKeyTtl;
+    }
+
+    public String requestId() { return requestId; }
+
+    @Override
+    public void close() {
+      if (released) return;
+      released = true;
+
+      String qKey = queueKey(accountId);
+      String leaseKey = leaseKey(accountId);
+      String seqKey = seqKey(accountId);
+
+      // RELEASE atómico: remueve actual, brinca zombies, asigna lease al siguiente y lo despierta
+      redis.execute(
+          releaseAndWake,
+          List.of(qKey, leaseKey, seqKey),
+          requestId,
+          String.valueOf(leaseTtl.toMillis()),
+          String.valueOf(waitKeyTtl.toMillis())
+      );
+
+      // cleanup best-effort
+      redis.delete(waitKey(requestId));
+      redis.delete(rqKey(requestId));
+    }
+  }
+
+  private String zsetHead(String qKey) {
+    Set<String> heads = redis.opsForZSet().range(qKey, 0, 0);
+    if (heads == null || heads.isEmpty()) return null;
+    return heads.iterator().next();
+  }
+
+  private static String queueKey(String accountId) { return "acct:{" + accountId + "}:q"; }
+  private static String leaseKey(String accountId) { return "acct:{" + accountId + "}:lease"; }
+  private static String seqKey(String accountId)   { return "acct:{" + accountId + "}:seq"; }
+  private static String waitKey(String requestId)  { return "wait:{" + requestId + "}"; }
+  private static String rqKey(String requestId)    { return "rq:{" + requestId + "}"; }
+
+  /**
+   * ENQUEUE + GO/WAIΤ (ZSET+BIG) + marker rq:{requestId} con TTL
+   *
+   * KEYS[1]=qKey, KEYS[2]=leaseKey, KEYS[3]=seqKey
+   * ARGV[1]=requestId, ARGV[2]=priority(0/1), ARGV[3]=BIG, ARGV[4]=leaseTtlMs, ARGV[5]=rqTtlMs
+   */
+  private static final String LUA_ENQUEUE_OR_GO_WITH_RQ = """
+  local qKey     = KEYS[1]
+  local leaseKey = KEYS[2]
+  local seqKey   = KEYS[3]
+
+  local requestId = ARGV[1]
+  local priority  = tonumber(ARGV[2])
+  local BIG       = tonumber(ARGV[3])
+  local leaseTtl  = ARGV[4]
+  local rqTtl     = ARGV[5]
+
+  -- marker de vida del request (auto-limpieza de zombies)
+  redis.call('SET', 'rq:{'..requestId..'}', '1', 'PX', rqTtl)
+
+  local seq = redis.call('INCR', seqKey)
+  local score = (priority * BIG) + seq
+  redis.call('ZADD', qKey, score, requestId)
+
+  local headArr = redis.call('ZRANGE', qKey, 0, 0)
+  local head = headArr[1]
+  if head == requestId then
+    local ok = redis.call('SET', leaseKey, requestId, 'NX', 'PX', leaseTtl)
+    if ok then return 1 end
+  end
+  return 0
+  """;
+
+  /**
+   * RELEASE + wake next, saltando zombies cuyo rq:{id} ya expiró.
+   * Limpia q/seq si queda vacío.
+   *
+   * KEYS[1]=qKey, KEYS[2]=leaseKey, KEYS[3]=seqKey
+   * ARGV[1]=requestId, ARGV[2]=leaseTtlMs, ARGV[3]=waitKeyTtlMs
+   */
+  private static final String LUA_RELEASE_AND_WAKE_SKIP_ZOMBIES = """
+  local qKey     = KEYS[1]
+  local leaseKey = KEYS[2]
+  local seqKey   = KEYS[3]
+
+  local requestId = ARGV[1]
+  local leaseTtl  = ARGV[2]
+  local waitTtl   = ARGV[3]
+
+  if redis.call('GET', leaseKey) ~= requestId then
+    return -1
+  end
+
+  redis.call('ZREM', qKey, requestId)
+  redis.call('DEL', leaseKey)
+  redis.call('DEL', 'rq:{'..requestId..'}') -- best-effort
+
+  while true do
+    local nextArr = redis.call('ZRANGE', qKey, 0, 0)
+    local next = nextArr[1]
+
+    if not next then
+      redis.call('DEL', qKey)
+      redis.call('DEL', seqKey)
+      return 0
+    end
+
+    if redis.call('EXISTS', 'rq:{'..next..'}') == 1 then
+      redis.call('SET', leaseKey, next, 'PX', leaseTtl)
+      local waitKey = 'wait:{'..next..'}'
+      redis.call('LPUSH', waitKey, 'GO')
+      redis.call('PEXPIRE', waitKey, waitTtl)
+      return 1
+    else
+      -- head zombie: quítalo y sigue buscando
+      redis.call('ZREM', qKey, next)
+    end
+  end
+  """;
+
+  /**
+   * CANCEL cuando el request hace timeout esperando turno.
+   * Remueve de la cola, borra marker/buzón, y si era ejecutor libera y despierta al siguiente válido.
+   *
+   * KEYS[1]=qKey, KEYS[2]=leaseKey, KEYS[3]=seqKey
+   * ARGV[1]=requestId, ARGV[2]=leaseTtlMs, ARGV[3]=waitKeyTtlMs
+   */
+  private static final String LUA_CANCEL_SKIP_ZOMBIES = """
+  local qKey     = KEYS[1]
+  local leaseKey = KEYS[2]
+  local seqKey   = KEYS[3]
+
+  local requestId = ARGV[1]
+  local leaseTtl  = ARGV[2]
+  local waitTtl   = ARGV[3]
+
+  redis.call('ZREM', qKey, requestId)
+  redis.call('DEL', 'rq:{'..requestId..'}')
+  redis.call('DEL', 'wait:{'..requestId..'}')
+
+  if redis.call('GET', leaseKey) == requestId then
+    redis.call('DEL', leaseKey)
+
+    while true do
+      local nextArr = redis.call('ZRANGE', qKey, 0, 0)
+      local next = nextArr[1]
+
+      if not next then
+        redis.call('DEL', qKey)
+        redis.call('DEL', seqKey)
+        return 1
+      end
+
+      if redis.call('EXISTS', 'rq:{'..next..'}') == 1 then
+        redis.call('SET', leaseKey, next, 'PX', leaseTtl)
+        local waitKey = 'wait:{'..next..'}'
+        redis.call('LPUSH', waitKey, 'GO')
+        redis.call('PEXPIRE', waitKey, waitTtl)
+        return 1
+      else
+        redis.call('ZREM', qKey, next)
+      end
+    end
+  end
+
+  return 1
+  """;
+}
