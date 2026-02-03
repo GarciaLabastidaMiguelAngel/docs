@@ -1,0 +1,68 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:oidcdb
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  
+  sql:
+    init:
+      mode: always
+
+  # Redis Configuration
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:}
+    timeout: 2000ms
+    jedis:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 0
+        max-wait: -1ms
+
+  # Spring Session with Redis
+  session:
+    store-type: redis
+    redis:
+      namespace: spring:session
+      flush-mode: on_save
+    timeout: 1800 # 30 minutes in seconds
+
+logging:
+  level:
+    root: INFO
+    org.springframework.security: DEBUG
+    org.springframework.security.saml2: DEBUG
+    org.springframework.security.web: DEBUG
+    org.springframework.security.oauth2: DEBUG
+    org.springframework.security.oauth2.server.authorization: TRACE
+
+# OIDC Issuer
+oidc:
+  issuer: ${OIDC_ISSUER:http://localhost:8080}
+  
+  # JWT Signing Keystore
+  keystore:
+    location: ${OIDC_KEYSTORE_LOCATION:classpath:keystore/oidc-keystore.p12}
+    password: ${OIDC_KEYSTORE_PASSWORD:changeit}
+    alias: ${OIDC_KEYSTORE_ALIAS:oidc}
+    key-password: ${OIDC_KEY_PASSWORD:changeit}
+
+# SAML2 Service Provider
+saml:
+  keystore:
+    location: ${SAML_KEYSTORE_LOCATION:classpath:keystore/saml-keystore.p12}
+    password: ${SAML_KEYSTORE_PASSWORD:changeit}
+    alias: ${SAML_KEYSTORE_ALIAS:saml}
+    key-password: ${SAML_KEY_PASSWORD:changeit}
+  
+  # Identity Provider "bet" - Local Mock IdP
+  idp:
+    entity-id: ${SAML_IDP_ENTITY_ID:BET}
+    sso-url: ${SAML_IDP_SSO_URL:http://localhost:8089}
+    verification-cert-location: ${SAML_IDP_CERT_LOCATION:file:/Users/miguel/Documents/FIFO/fifo-oidc-server/tools/idp-mock/nginx/certs/idp.crt.pem}
