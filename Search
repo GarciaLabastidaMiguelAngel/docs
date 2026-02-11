@@ -1,0 +1,52 @@
+sequenceDiagram
+    participant U as User
+    participant G as Gateway API Connect
+    participant M as Microservice x-service
+    participant MQI as IBM MQ IN
+    participant GR as Mainframe CICS 390
+    participant MQO as IBM MQ OUT
+    participant D as Message Dispatcher (domain)
+    participant R as Redis Pub/Sub
+
+    U->>G: POST /customers/search
+    G->>M: Forward request
+
+    M->>M: Validación campos de entrada
+
+    alt Validation error
+        M-->>G: 400 Bad Request
+        G-->>U: Error
+    else Valid input
+
+        %% ---- TRX PE47 ----
+        M->>MQI: Publish TRX PE47 (corrId, replyTo)
+        MQI->>GR: Execute PE47
+        GR->>MQO: PE47 Response (corrId)
+        MQO->>D: Consume PE47 response
+        D->>R: PUBLISH trx.response.{corrId}
+        R-->>M: SUBSCRIBE receive PE47 response
+
+        alt Code-message = PEA0000 (OK)
+            %% ---- TRX PE61 ----
+            M->>MQI: Publish TRX PE61 (corrId, replyTo)
+            MQI->>GR: Execute PE61
+            GR->>MQO: PE61 Response (corrId)
+            MQO->>D: Consume PE61 response
+            D->>R: PUBLISH trx.response.{corrId}
+            R-->>M: SUBSCRIBE receive PE61 response
+
+            %% ---- TRX TCGG (descripciones/tablas) ----
+            M->>MQI: Publish TRX TCGG (corrId, replyTo)
+            MQI->>GR: Execute TCGG
+            GR->>MQO: TCGG Response (corrId)
+            MQO->>D: Consume TCGG response
+            D->>R: PUBLISH trx.response.{corrId}
+            R-->>M: SUBSCRIBE receive TCGG response
+
+            M-->>G: 200 OK (customers search response)
+            G-->>U: 200 OK
+        else Core Error (KO)
+            M-->>G: 400 / 500
+            G-->>U: Error
+        end
+    end
