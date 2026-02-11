@@ -1,0 +1,56 @@
+sequenceDiagram
+    participant U as User
+    participant G as API Gateway
+    participant M as Mirror Agreements API (microservice)
+    participant P as PKM (Public Key Manager)
+    participant MQI as IBM MQ IN
+    participant GR as Gravity (Core)
+    participant MQO as IBM MQ OUT
+    participant D as Message Dispatcher (domain)
+    participant R as Redis Pub/Sub
+
+    U->>G: POST /mirror_agreements + JWSID
+    G->>G: Validate JWSID-1
+    G->>G: Re-mint JWSID-2 (audience swap)
+    G->>M: Forward Request + JWSID-2
+
+    M->>P: Get public key (kid)
+    P-->>M: Public key
+    M->>M: Validate JWSID-2
+    M->>M: Validate input data
+
+    alt Validation error
+        M-->>G: 400 Bad Request
+        G-->>U: 400
+    else Valid request
+
+        %% --- TRX 1 ---
+        M->>MQI: Publish TRX LT42 (corrId, replyTo)
+        MQI->>GR: Execute LT42
+        GR->>MQO: LT42 Response (corrId)
+        MQO->>D: Consume LT42 response
+        D->>R: PUBLISH trx.response.{corrId}
+        R-->>M: SUBSCRIBE receive LT42 response
+
+        alt TRX LT42 error
+            M-->>G: Error 400 / 500
+            G-->>U: Error
+        else OK
+
+            %% --- TRX 2 ---
+            M->>MQI: Publish TRX OD48 (corrId, replyTo)
+            MQI->>GR: Execute OD48
+            GR->>MQO: OD48 Response (corrId)
+            MQO->>D: Consume OD48 response
+            D->>R: PUBLISH trx.response.{corrId}
+            R-->>M: SUBSCRIBE receive OD48 response
+
+            alt TRX OD48 error
+                M-->>G: Error 400 / 500
+                G-->>U: Error
+            else OK
+                M-->>G: 201 Created
+                G-->>U: 201 Created
+            end
+        end
+    end
