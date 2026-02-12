@@ -1,0 +1,111 @@
+sequenceDiagram
+    participant U as User
+    participant G as API Gateway (API Connect)
+    participant M as Microservice x-service
+    participant P as PKM (Public Key Manager)
+    participant MQI as IBM MQ IN
+    participant GR as Mainframe CICS 390 (Gravity)
+    participant MQO as IBM MQ OUT
+    participant D as Message Dispatcher (domain)
+    participant R as Redis Pub/Sub
+
+    %% --- Security context with JWSID ---
+    U->>G: POST /customers/search + JWSID-1
+    G->>G: Validate JWSID-1
+    G->>G: Re-mint JWSID-2 (audience swap)
+    G->>M: Forward request + JWSID-2
+
+    M->>P: Get public key (kid)
+    P-->>M: Public key
+    M->>M: Validate JWSID-2
+    M->>M: Validate input fields (search_type & payload)
+
+    alt Validation error (missing / malformed)
+        M-->>G: 400 Bad Request
+        G-->>U: 400
+    else Valid request
+
+        alt Case 1: Search by general data (name / birthDate / document)
+            %% TRX PE47
+            M->>MQI: Publish TRX PE47 (corrId, replyTo)
+            MQI->>GR: Execute PE47
+            GR->>MQO: PE47 Response (corrId)
+            MQO->>D: Consume response
+            D->>R: PUBLISH trx.response.{corrId}
+            R-->>M: SUBSCRIBE receive PE47 response
+
+            alt Code-message == PEA0000 (OK)
+                %% TRX PE61
+                M->>MQI: Publish TRX PE61 (corrId, replyTo)
+                MQI->>GR: Execute PE61
+                GR->>MQO: PE61 Response (corrId)
+                MQO->>D: Consume response
+                D->>R: PUBLISH trx.response.{corrId}
+                R-->>M: SUBSCRIBE receive PE61 response
+
+                %% TRX TCGG (catalog descriptions)
+                M->>MQI: Publish TRX TCGG (corrId, replyTo)
+                MQI->>GR: Execute TCGG
+                GR->>MQO: TCGG Response (corrId)
+                MQO->>D: Consume response
+                D->>R: PUBLISH trx.response.{corrId}
+                R-->>M: SUBSCRIBE receive TCGG response
+
+                M-->>G: 200 OK (customers search response)
+                G-->>U: 200 OK
+            else Core error / KO
+                M-->>G: 400 / 403 / 500
+                G-->>U: Error
+            end
+
+        else Case 2: Search by email
+            %% TRX PEBC
+            M->>MQI: Publish TRX PEBC (corrId, replyTo)
+            MQI->>GR: Execute PEBC
+            GR->>MQO: PEBC Response (corrId)
+            MQO->>D: Consume response
+            D->>R: PUBLISH trx.response.{corrId}
+            R-->>M: SUBSCRIBE receive PEBC response
+
+            alt Code-message == PEA0077 (OK)
+                %% TRX TCGG (catalog descriptions)
+                M->>MQI: Publish TRX TCGG (corrId, replyTo)
+                MQI->>GR: Execute TCGG
+                GR->>MQO: TCGG Response (corrId)
+                MQO->>D: Consume response
+                D->>R: PUBLISH trx.response.{corrId}
+                R-->>M: SUBSCRIBE receive TCGG response
+
+                M-->>G: 200 OK
+                G-->>U: 200 OK
+            else Core error / KO
+                M-->>G: 400 / 403 / 500
+                G-->>U: Error
+            end
+
+        else Case 3: Search by mobile or phone
+            %% TRX PEBT
+            M->>MQI: Publish TRX PEBT (corrId, replyTo)
+            MQI->>GR: Execute PEBT
+            GR->>MQO: PEBT Response (corrId)
+            MQO->>D: Consume response
+            D->>R: PUBLISH trx.response.{corrId}
+            R-->>M: SUBSCRIBE receive PEBT response
+
+            alt Code-message == PEA0077 (OK)
+                %% TRX TCGG (catalog descriptions)
+                M->>MQI: Publish TRX TCGG (corrId, replyTo)
+                MQI->>GR: Execute TCGG
+                GR->>MQO: TCGG Response (corrId)
+                MQO->>D: Consume response
+                D->>R: PUBLISH trx.response.{corrId}
+                R-->>M: SUBSCRIBE receive TCGG response
+
+                M-->>G: 200 OK
+                G-->>U: 200 OK
+            else Core error / KO
+                M-->>G: 400 / 403 / 500
+                G-->>U: Error
+            end
+        end
+    end
