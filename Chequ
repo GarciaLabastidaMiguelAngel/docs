@@ -1,0 +1,37 @@
+sequenceDiagram
+    participant U as User
+    participant G as API Gateway
+    participant M as Cheques API (Microservice)
+    participant MQI as IBM MQ IN
+    participant GR as Gravity (CICS 390)
+    participant MQO as IBM MQ OUT
+    participant D as Message Dispatcher (domain)
+    participant R as Redis Pub/Sub
+
+    U->>G: GET /v1/cheques/{cheque_id} + Authorization
+    G->>M: Forward request
+
+    M->>M: Data initialization & validate input
+
+    alt Validation error
+        M-->>G: 400 Bad Request
+        G-->>U: 400
+    else Valid request
+
+        %% ---- TRX B432 ----
+        M->>MQI: Publish TRX B432 (corrId, replyTo)
+        MQI->>GR: Execute B432
+        GR->>MQO: B432 Response (corrId)
+
+        MQO->>D: Consume response
+        D->>R: PUBLISH trx.response.{corrId}
+        R-->>M: SUBSCRIBE receive B432 response
+
+        alt TRX-Response == OK
+            M-->>G: 200 OK (Cheque details)
+            G-->>U: 200 OK
+        else TRX-Response == ERROR
+            M-->>G: 400 / 500
+            G-->>U: Error
+        end
+    end
