@@ -1,0 +1,110 @@
+sequenceDiagram
+autonumber
+
+actor Channel as Canal_Cliente
+participant GW as API_Connect_Gateway
+participant CS as sgt-carsec-cardsecuritymx
+participant CPL as sgt-cardpl-cardplacelocator
+participant Cipher as cipher-service
+participant Redis as Redis_PubSub_OD48
+participant Disp as OD48_Dispatcher
+participant MQIN as IBM_MQ_IN
+participant MQOUT as IBM_MQ_OUT
+participant Gravity as Gravity_CICS
+participant CardJWKS as Card_JWKS_API
+participant PLJWKS as PLARD_4_0_0_JWKS
+participant PLARD as PLARD_4_0_0
+
+%% =========================
+%% Bootstrap (canal obtiene JWKS del banco)
+%% =========================
+opt Bootstrap canal para cifrar request hacia 4_1_2
+  Channel->>CardJWKS: GET jwks
+  CardJWKS-->>Channel: JWKS + kid_bank_enc
+end
+
+%% =========================
+%% Entrada Change PIN a 4.1.2 (fachada)
+%% =========================
+Channel->>GW: POST change_pin (application_jose JWE) + Authorization JWSID
+GW->>GW: validate JWSID
+GW->>CS: forward JWE + security context
+
+Note over CS: Regla\nCS nunca abre el JWE\nCS nunca ve PIN ni PINBLOCK en claro\nTodo sensible se delega a cipher-service
+
+%% Resolver card place solo con card_id (no abrir JWE)
+CS->>CPL: resolvePlace(card_id)
+CPL-->>CS: place GRAVITY or PLARD
+
+alt place == GRAVITY
+
+  Note over CS,Disp: GRAVITY usa OD48\nCS publica request a Redis\nDispatcher consume y llama MQ\nDispatcher publica respuesta a Redis\nCS consume respuesta y responde al canal
+
+  %% Publicacion request a Redis (OD48)
+  CS->>Redis: PUBLISH OD48.change_pin.req (corr_id, card_id, inbound_jwe)
+
+  %% Dispatcher consume request
+  Redis-->>Disp: SUBSCRIBE OD48.change_pin.req (corr_id, card_id, inbound_jwe)
+
+  %% LMPB para llave dinamica
+  Disp->>MQIN: TRX LMPB request (corr_id, card_id)
+  MQIN->>Gravity: execute LMPB
+  Gravity-->>MQOUT: LMPB response (corr_id, dynamicKey, keyId)
+  MQOUT-->>Disp: dynamicKey + keyId
+
+  %% Cipher produce pinblock cifrado con dynamicKey (CS nunca ve claro)
+  Disp->>Cipher: encryptPinblockWithDynamicKey (inbound_jwe, dynamicKey)
+  Cipher-->>Disp: pinblock_encrypted_with_dynKey
+
+  %% LMPC cambio de pin
+  Disp->>MQIN: TRX LMPC request (corr_id, card_id, pinblock_encrypted_with_dynKey, keyId)
+  MQIN->>Gravity: execute LMPC
+  Gravity-->>MQOUT: LMPC response (corr_id, status, code)
+  MQOUT-->>Disp: status + code
+
+  %% Publicacion respuesta a Redis (OD48)
+  Disp->>Redis: PUBLISH OD48.change_pin.resp (corr_id, status, code)
+
+  %% CS consume respuesta correlacionada
+  Redis-->>CS: SUBSCRIBE OD48.change_pin.resp (corr_id, status, code)
+
+  %% Respuesta al canal siempre en JWE
+  CS->>Cipher: encryptResponseForChannel (status, code, inbound_jwe)
+  Cipher-->>CS: JWE response
+  CS-->>GW: JWE response
+  GW-->>Channel: JWE response
+
+else place == PLARD
+
+  Note over CS,PLARD: PLARD no usa Dispatcher\nCS coordina directo PLARD 4_0_0\nCipher arma JWS y JWE\nRespuestas siempre application_jose JWE
+
+  %% Obtener JWKS de PLARD
+  CS->>PLJWKS: GET jwks
+  PLJWKS-->>CS: kid_plard + plard_public_key
+
+  %% Dynamic PEK: construir request firmado y cifrado
+  CS->>Cipher: buildDynamicPekJwsJwe (inbound_jwe, kid_plard, plard_public_key, jws_signing_key_id)
+  Cipher-->>CS: plard_auth_jws + jwe_dynamic_pek_req
+  CS->>PLARD: POST dynamic_pek (Authorization plard_auth_jws, kid_plard, body jwe_dynamic_pek_req)
+  PLARD-->>CS: jwe_dynamic_pek_resp
+
+  %% Extraer PEK y producir pinblock cifrado con PEK (CS nunca ve claro)
+  CS->>Cipher: extractPekAndEncryptPinblock (inbound_jwe, jwe_dynamic_pek_resp)
+  Cipher-->>CS: pinblock_encrypted_with_pek + pek_token
+
+  %% Change PIN: armar _change_pin_input_structure y envolver JWS JWE
+  CS->>Cipher: buildChangePinJwsJwe (card_id, pinblock_encrypted_with_pek, pek_token, kid_plard, plard_public_key, jws_signing_key_id)
+  Cipher-->>CS: plard_auth_jws_2 + jwe_change_pin_req
+  CS->>PLARD: POST change_pin (Authorization plard_auth_jws_2, kid_plard, body jwe_change_pin_req)
+  PLARD-->>CS: jwe_change_pin_resp
+
+  %% Re-cifrar respuesta PLARD al canal (siempre JWE)
+  CS->>Cipher: reencryptPlardResponseForChannel (jwe_change_pin_resp, inbound_jwe)
+  Cipher-->>CS: JWE response
+  CS-->>GW: JWE response
+  GW-->>Channel: JWE response
+
+end
+
+Note over Redis: Redis es PubSub OD48\nNo cache en este flujo
+
