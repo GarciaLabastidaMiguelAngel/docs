@@ -1,10 +1,10 @@
 sequenceDiagram
-autonumber
 
 actor Channel
 participant GW as API_Connect
 participant CS as sgt_carsec_cardsecuritymx
 participant CPL as sgt_cardpl_cardplacelocator
+
 participant Cipher as cipher_service
 
 participant MQIN as IBM_MQ_IN
@@ -63,29 +63,47 @@ alt place GRAVITY
 
 else place PLARD
 
-  Note over CS,PLARD: PLARD_API_FLOW
+  Note over CS,PLARD: PLARD_API_FLOW_DETAILED
 
+  %% Step 0 get PLARD jwks
   CS->>PLJWKS: GET jwks
-  PLJWKS-->>CS: kidPlard plardPublicKey
+  PLJWKS-->>CS: kidPlardEnc plardPublicKey
 
-  CS->>Cipher: buildDynamicPekRequest inbound_JWE kidPlard plardPublicKey signingKeyId
-  Cipher-->>CS: plardAuthJWS jweDynamicPekReq
+  %% Step 1 generate ephemeral key pair for PEK response
+  CS->>Cipher: generateEphemeralKeyPair purpose PEK_response
+  Cipher-->>CS: pekEphemeralPublicKey pekEphemeralKeyId
 
-  CS->>PLARD: POST dynamic_pek plardAuthJWS kidPlard jweDynamicPekReq
-  PLARD-->>CS: jwtDynamicPekResp
+  %% Step 2 build PEK request payload and wrap it
+  Note over CS,Cipher: PEK_request_payload uses Generate_pek_input_structure\nand includes pekEphemeralPublicKey\nCipher builds JWE encrypted with PLARD jwks kidPlardEnc\nCipher signs JWS using signingKeyId from Cipher JKS
 
-  CS->>Cipher: decryptDynamicPecResponse jwtDynamicPekResp
-  Cipher-->>CS: pecKey pecToken
+  CS->>Cipher: buildPEKRequestJwsJwe inbound_JWE kidPlardEnc plardPublicKey signingKeyId pekEphemeralPublicKey
+  Cipher-->>CS: pekAuthJWS jwePEKReq
 
-  CS->>Cipher: encryptPinblockWithPec inbound_JWE pecKey
-  Cipher-->>CS: jsonWithEncryptedPinblock pecToken
+  %% Step 3 call PEK endpoint in PLARD
+  CS->>PLARD: POST dynamic_pek Authorization pekAuthJWS kidPlardEnc body jwePEKReq
+  PLARD-->>CS: jwePEKResp
 
-  CS->>Cipher: buildChangePinRequest card_id jsonWithEncryptedPinblock pecToken kidPlard plardPublicKey signingKeyId
+  %% Step 4 decrypt PEK response to get PEK assigned
+  CS->>Cipher: decryptPEKResponse jwePEKResp pekEphemeralKeyId
+  Cipher-->>CS: pekKey pekToken
+
+  %% Step 5 use PEK key and original inbound JWE to produce encrypted pinblock json
+  Note over CS,Cipher: Cipher opens inbound_JWE internally\nCS never sees clear data\nCipher returns json with encrypted pinblock plus pekToken
+
+  CS->>Cipher: encryptPinblockWithPEK inbound_JWE pekKey
+  Cipher-->>CS: jsonWithEncryptedPinblock pekToken
+
+  %% Step 6 build ChangePin request structure and wrap as JWS and JWE
+  Note over CS,Cipher: ChangePin_input_structure includes\njsonWithEncryptedPinblock and pekToken\nCipher encrypts with PLARD jwks kidPlardEnc\nCipher signs JWS with signingKeyId in Cipher JKS
+
+  CS->>Cipher: buildChangePinRequestJwsJwe card_id jsonWithEncryptedPinblock pekToken kidPlardEnc plardPublicKey signingKeyId
   Cipher-->>CS: plardAuthJWS2 jweChangePinReq
 
-  CS->>PLARD: POST change_pin plardAuthJWS2 kidPlard jweChangePinReq
+  %% Step 7 call PLARD change_pin
+  CS->>PLARD: POST change_pin Authorization plardAuthJWS2 kidPlardEnc body jweChangePinReq
   PLARD-->>CS: jweChangePinResp
 
+  %% Step 8 reencrypt response to channel using inbound JWE
   CS->>Cipher: reencryptPlardResponseForChannel jweChangePinResp inbound_JWE
   Cipher-->>CS: outbound_JWE
   CS-->>GW: outbound_JWE
