@@ -1,0 +1,43 @@
+sequenceDiagram
+  participant C as Channel/App
+  participant GW as API Connect 10.x
+  participant SGT as sgt-carsec-cardsecuritymx (4.1.2 Facade)
+  participant CPL as sgt-cardpl-cardplacelocator
+  participant Cipher as cipher-service (crypto-as-a-service)
+  participant MQI as IBM MQ IN
+  participant GR as Gravity / CICS 390
+  participant MQO as IBM MQ OUT
+
+  C->>GW: POST /card_security/{card_id}/change_pin\nAuth: JWSID-1\nHeaders: input-encryption-public-kid\nBody: JWE (application/jose)
+  GW->>GW: Validate JWSID-1 / Re-mint JWSID-2
+  GW->>SGT: Forward (JWSID-2)\nBody: JWE
+
+  SGT->>CPL: Resolve place(card_id)
+  CPL-->>SGT: place = GRAVITY
+
+  %% 1) Get dynamic key for PIN block encryption
+  Note over SGT,GR: TRX LMPB = get dynamic key (PEK/PECK) + keyId
+  SGT->>MQI: TRX LMPB request (corrId, replyTo)\nParams: card_id / context
+  MQI->>GR: Execute TRX LMPB
+  GR->>MQO: TRX LMPB response (corrId)\nReturns: PEK(3DES) + keyId
+  MQO-->>SGT: LMPB response: PEK + keyId
+
+  %% 2) Transform JWE into encrypted pinblock using LMPB key
+  Note over SGT,Cipher: Cipher transforms:\n- decrypt/parse JWE\n- "change audience" from JWE payload -> PINBLOCK\n- encrypt PINBLOCK with PEK(3DES)\n- output pinblockCiphertext
+  SGT->>Cipher: TransformChangePin(JWE, kid, PEK)\n-> pinblockCiphertext + metadata
+  Cipher-->>SGT: pinblockCiphertext (encrypted w/ PEK) + fields for LMPC
+
+  %% 3) Execute PIN change in Gravity using keyId
+  Note over SGT,GR: TRX LMPC = change PIN using pinblockCiphertext + keyId
+  SGT->>MQI: TRX LMPC request (corrId, replyTo)\nPayload: card_id, pinblockCiphertext, keyId, ...
+  MQI->>GR: Execute TRX LMPC (Change PIN)
+  GR->>MQO: TRX LMPC response (corrId)\nOK/ERROR + codes
+  MQO-->>SGT: LMPC response
+
+  %% 4) Always respond as JWE
+  Note over SGT,Cipher: Wrap final response as JWE for client\n(using clientEphemeralPublicKey from original request)
+  SGT->>Cipher: EncryptResponseAsJWE(LMPC response, clientEphemeralPublicKey)
+  Cipher-->>SGT: Response JWE
+  SGT-->>GW: Response JWE
+  GW-->>C: Response JWE
+  C->>C: Decrypt with ephemeral private key
