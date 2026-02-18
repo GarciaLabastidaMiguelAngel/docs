@@ -1,0 +1,94 @@
+sequenceDiagram
+autonumber
+
+actor Channel
+participant GW as API_Connect
+participant CS as sgt_carsec_cardsecuritymx
+participant CPL as sgt_cardpl_cardplacelocator
+participant Cipher as cipher_service
+
+participant MQIN as IBM_MQ_IN
+participant MQOUT as IBM_MQ_OUT
+participant Gravity as Gravity_CICS
+participant Core as Core_Bancario
+participant Disp as Dispatcher_Service
+participant Redis as Redis_PubSub
+
+participant PLJWKS as PLARD_JWKS_4_0_0
+participant PLARD as PLARD_API_4_0_0
+
+%% BOOTSTRAP
+Note over CS,Redis: BOOTSTRAP_SUBSCRIBE_ONCE
+CS->>Redis: SUBSCRIBE cardsec_trx_responses
+
+%% REQUEST
+Channel->>GW: POST change_pin inbound_JWE plus JWSID
+GW->>GW: validate JWSID
+GW->>CS: forward inbound_JWE
+
+Note over CS: CS never opens inbound_JWE
+CS->>CPL: resolvePlace card_id
+CPL-->>CS: place GRAVITY or PLARD
+
+alt place GRAVITY
+
+  Note over CS,Disp: GRAVITY_TRX_FLOW
+  CS->>MQIN: LMPB request corrId1 card_id
+  MQIN->>Gravity: deliver LMPB
+  Gravity->>Core: execute LMPB
+  Core-->>Gravity: dynamicKey keyId
+  Gravity-->>MQOUT: LMPB response corrId1 dynamicKey keyId
+
+  MQOUT-->>Disp: read corrId1 dynamicKey keyId
+  Disp->>Redis: PUBLISH cardsec_trx_responses corrId1 dynamicKey keyId
+
+  Redis-->>CS: message corrId1 dynamicKey keyId
+  CS->>Cipher: encryptPinblockWithDynamicKey inbound_JWE dynamicKey
+  Cipher-->>CS: pinblockEncrypted
+
+  CS->>MQIN: LMPC request corrId2 card_id pinblockEncrypted keyId
+  MQIN->>Gravity: deliver LMPC
+  Gravity->>Core: execute LMPC
+  Core-->>Gravity: status code
+  Gravity-->>MQOUT: LMPC response corrId2 status code
+
+  MQOUT-->>Disp: read corrId2 status code
+  Disp->>Redis: PUBLISH cardsec_trx_responses corrId2 status code
+
+  Redis-->>CS: message corrId2 status code
+  CS->>Cipher: encryptResponseForChannel status code inbound_JWE
+  Cipher-->>CS: outbound_JWE
+  CS-->>GW: outbound_JWE
+  GW-->>Channel: outbound_JWE
+
+else place PLARD
+
+  Note over CS,PLARD: PLARD_API_FLOW
+
+  CS->>PLJWKS: GET jwks
+  PLJWKS-->>CS: kidPlard plardPublicKey
+
+  CS->>Cipher: buildDynamicPekRequest inbound_JWE kidPlard plardPublicKey signingKeyId
+  Cipher-->>CS: plardAuthJWS jweDynamicPekReq
+
+  CS->>PLARD: POST dynamic_pek plardAuthJWS kidPlard jweDynamicPekReq
+  PLARD-->>CS: jwtDynamicPekResp
+
+  CS->>Cipher: decryptDynamicPecResponse jwtDynamicPekResp
+  Cipher-->>CS: pecKey pecToken
+
+  CS->>Cipher: encryptPinblockWithPec inbound_JWE pecKey
+  Cipher-->>CS: jsonWithEncryptedPinblock pecToken
+
+  CS->>Cipher: buildChangePinRequest card_id jsonWithEncryptedPinblock pecToken kidPlard plardPublicKey signingKeyId
+  Cipher-->>CS: plardAuthJWS2 jweChangePinReq
+
+  CS->>PLARD: POST change_pin plardAuthJWS2 kidPlard jweChangePinReq
+  PLARD-->>CS: jweChangePinResp
+
+  CS->>Cipher: reencryptPlardResponseForChannel jweChangePinResp inbound_JWE
+  Cipher-->>CS: outbound_JWE
+  CS-->>GW: outbound_JWE
+  GW-->>Channel: outbound_JWE
+
+end
