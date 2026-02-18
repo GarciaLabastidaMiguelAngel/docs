@@ -1,0 +1,109 @@
+sequenceDiagram
+autonumber
+
+actor Channel as Canal_Cliente
+participant GW as API_Connect
+participant CS as sgt-carsec-cardsecuritymx
+participant CPL as sgt-cardpl-cardplacelocator
+participant Cipher as cipher-service
+
+participant MQIN as IBM_MQ_IN
+participant MQOUT as IBM_MQ_OUT
+participant Gravity as Gravity_CICS
+participant Core as Core_Bancario
+
+participant Disp as Dispatcher_Service
+participant Redis as Redis_PubSub
+
+participant PLJWKS as PLARD_4_0_0_JWKS
+participant PLARD as PLARD_4_0_0_API
+
+%% =========================================================
+%% BOOTSTRAP DEL MICROSERVICIO (una sola vez)
+%% =========================================================
+Note over CS,Redis: Bootstrap\nCS se suscribe una sola vez a un canal fijo de respuestas.\nEl Dispatcher publica ahi, y CS correlaciona por corrId.
+
+CS->>Redis: SUBSCRIBE cardsec.trx.responses
+
+%% =========================================================
+%% REQUEST PRINCIPAL
+%% =========================================================
+Channel->>GW: POST change_pin (JWE) + Authorization JWSID
+GW->>GW: validate JWSID
+GW->>CS: forward inbound_JWE
+
+Note over CS: Regla\nCS nunca abre inbound_JWE\nCS nunca ve PIN ni PINBLOCK en claro
+
+CS->>CPL: resolvePlace(card_id)
+CPL-->>CS: place GRAVITY or PLARD
+
+alt place == GRAVITY
+
+  Note over CS,Disp: Gravity por TRX\nCS envia a MQ_IN\nGravity responde por MQ_OUT\nDispatcher escucha MQ_OUT y publica en Redis (canal fijo)\nCS recibe de Redis y correlaciona por corrId
+
+  %% LMPB
+  CS->>MQIN: TRX LMPB request (corrId1, card_id)
+  MQIN->>Gravity: deliver LMPB
+  Gravity->>Core: execute LMPB
+  Core-->>Gravity: dynamicKey + keyId
+  Gravity-->>MQOUT: LMPB response (corrId1, dynamicKey, keyId)
+
+  MQOUT-->>Disp: LMPB response (corrId1, dynamicKey, keyId)
+  Disp->>Redis: PUBLISH cardsec.trx.responses (corrId1, dynamicKey, keyId)
+
+  Redis-->>CS: message (corrId1, dynamicKey, keyId)
+  Note over CS: CS enruta internamente la respuesta\nal request en espera usando corrId1
+
+  CS->>Cipher: encryptPinblockWithDynamicKey\ninputs: inbound_JWE + dynamicKey
+  Cipher-->>CS: pinblock_encrypted_with_dynKey
+
+  %% LMPC
+  CS->>MQIN: TRX LMPC request (corrId2, card_id, pinblock_encrypted_with_dynKey, keyId)
+  MQIN->>Gravity: deliver LMPC
+  Gravity->>Core: execute LMPC
+  Core-->>Gravity: status + code
+  Gravity-->>MQOUT: LMPC response (corrId2, status, code)
+
+  MQOUT-->>Disp: LMPC response (corrId2, status, code)
+  Disp->>Redis: PUBLISH cardsec.trx.responses (corrId2, status, code)
+
+  Redis-->>CS: message (corrId2, status, code)
+  Note over CS: CS correlaciona por corrId2\ny completa el flujo del request
+
+  CS->>Cipher: encryptResponseForChannel\ninputs: status + code + inbound_JWE
+  Cipher-->>CS: outbound_JWE
+  CS-->>GW: outbound_JWE
+  GW-->>Channel: outbound_JWE
+
+else place == PLARD
+
+  Note over CS,PLARD: PLARD por API\nNo MQ\nNo Dispatcher\nPLARD siempre responde application_jose (JWE)
+
+  CS->>PLJWKS: GET jwks
+  PLJWKS-->>CS: kid_plard + plard_public_key
+
+  CS->>Cipher: buildDynamicPekJwsJwe\ninputs: inbound_JWE + kid_plard + plard_public_key + signing_key_id
+  Cipher-->>CS: plard_auth_jws + jwe_dynamic_pek_req
+
+  CS->>PLARD: POST dynamic_pek\nheaders: Authorization plard_auth_jws, kid_plard\nbody: jwe_dynamic_pek_req
+  PLARD-->>CS: jwt_dynamic_pek_response (JWE)
+
+  CS->>Cipher: decryptDynamicPecResponse\ninputs: jwt_dynamic_pek_response
+  Cipher-->>CS: pec_key_assigned + pec_token
+
+  CS->>Cipher: signAndEncryptPinblockFromOriginal\ninputs: inbound_JWE + pec_key_assigned\noutput: json_with_pinblock_encrypted
+  Cipher-->>CS: json_with_pinblock_encrypted + pec_token
+
+  CS->>Cipher: buildChangePinJwsJwe\ninputs: card_id + json_with_pinblock_encrypted + pec_token\n+ kid_plard + plard_public_key + signing_key_id
+  Cipher-->>CS: plard_auth_jws_2 + jwe_change_pin_req
+
+  CS->>PLARD: POST change_pin\nheaders: Authorization plard_auth_jws_2, kid_plard\nbody: jwe_change_pin_req
+  PLARD-->>CS: jwe_change_pin_resp (JWE)
+
+  CS->>Cipher: reencryptPlardResponseForChannel\ninputs: jwe_change_pin_resp + inbound_JWE
+  Cipher-->>CS: outbound_JWE
+  CS-->>GW: outbound_JWE
+  GW-->>Channel: outbound_JWE
+
+end
+lp
