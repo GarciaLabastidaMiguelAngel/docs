@@ -1,0 +1,111 @@
+sequenceDiagram
+autonumber
+
+actor CH as Canal/Cliente
+participant GW as API Gateway (API Connect)
+participant CS as Card-Security v4.1.2 (Micro fachada)
+participant CPL as Card Place Locator
+participant CIPH as cipher-service (Decrypt/Encrypt)
+participant JWKS as API Card-JWKS (nuestra) /jwks
+participant PLJWKS as PLARD Card-Security v4.0.0 /jwks (interno)
+participant PL as PLARD Card-Security v4.0.0 (interno)
+
+participant MQIN as IBM MQ IN
+participant MQOUT as IBM MQ OUT
+participant CIC as Gravity / CICS
+
+%% =========================================================
+%% 0) Bootstrap (canal obtiene JWKS nuestra para cifrar request a 4.1.2)
+%% =========================================================
+opt Bootstrap de canal (antes del change_pin)
+  CH->>JWKS: GET /card_jwks/jwks
+  JWKS-->>CH: JWKS RSA-2048 + kid(s)
+  Note over CH,JWKS: El canal cifra el request como JWE (application/jose)\nusando nuestra public key (kid).
+end
+
+%% =========================================================
+%% 1) Entrada principal: /{card_id}/change_pin en 4.1.2
+%% =========================================================
+CH->>GW: POST /{card_id}/change_pin\nHeaders: Authorization=JWSID, x-santander-client-id,\ninput-encryption-public-kid=<kid_nuestro>\nBody: JWE(request) (incluye PIN/PINBLOCK/EMV/...) + publicKey efímera p/ respuesta
+GW->>GW: Validar JWSID (authz/authn)
+GW->>CS: Forward\nAuthorization=JWSID (o interno)\nBody=JWE(request)\nHeaders (kid_nuestro, client-id,...)
+
+Note over CS: Regla: CS (4.1.2) NO abre el JWE.\nNo puede ver PIN/PINBLOCK/EMV en claro.\nSolo usa card_id para decidir ruta.
+
+%% =========================================================
+%% 2) Card Place (solo con card_id)
+%% =========================================================
+CS->>CPL: resolvePlace(card_id)
+CPL-->>CS: place = GRAVITY | PLARD
+
+alt place == GRAVITY
+  %% =======================================================
+  %% GRAVITY: obtener dynKey/keyId (LMPB) y pedir a cipher que produzca PINBLOCK cifrado con dynKey
+  %% =======================================================
+  Note over CS,CIC: En Gravity el canal trae el pinblock ya formado (pero dentro del JWE).\nCS nunca lo ve.
+
+  CS->>MQIN: TRX LMPB (get dynamic key)\nInput: card_id + contexto
+  MQIN->>CIC: Deliver LMPB
+  CIC-->>MQOUT: LMPB response (dynamicEncryptionKey + keyId)
+  MQOUT-->>CS: dynamicEncryptionKey + keyId
+
+  %% Cipher transforma "payload cifrado del canal" -> "PINBLOCK cifrado con dynKey"
+  CS->>CIPH: encryptPinblockWithDynamicKey\nInput:\n- inbound JWE(request) (SIN abrir por CS)\n- kid_nuestro (para que cipher ubique llave privada y pueda descifrar)\n- dynamicEncryptionKey (LMPB)\nOutput: pinblock_encrypted + (opcional) campos mínimos no sensibles
+  CIPH-->>CS: pinblock_encrypted_with_dynKey
+
+  %% Ejecutar LMPC con PINBLOCK cifrado y keyId
+  CS->>MQIN: TRX LMPC (change pin)\nInput:\n- card_id\n- pinblock_encrypted_with_dynKey\n- keyId (LMPB)
+  MQIN->>CIC: Deliver LMPC
+  CIC-->>MQOUT: LMPC response (OK/ERROR + codes)
+  MQOUT-->>CS: LMPC response
+
+  %% Respuesta de 4.1.2 siempre JWE hacia canal (cipher cifra con publicKey efímera del canal)
+  CS->>CIPH: encryptResponseForChannel\nInput:\n- response payload (OK/ERROR)\n- channel ephemeral publicKey (viene dentro del inbound JWE)\n(Nota: CS no la ve en claro; puede pasar "JWE original" a cipher para extraerla)
+  CIPH-->>CS: JWE(response)
+  CS-->>GW: 200/4xx + Body=JWE(response)
+  GW-->>CH: 200/4xx + Body=JWE(response)
+
+else place == PLARD
+  %% =======================================================
+  %% PLARD: CS coordina consumo de API 4.0.0 (cliente nunca la conoce)
+  %% =======================================================
+  Note over CS,PL: PLARD: CS debe construir request a 4.0.0\nsin ver PIN/PINBLOCK en claro.
+
+  %% 1) CS obtiene JWKS de 4.0.0 (para cifrar hacia PLARD)
+  CS->>PLJWKS: GET /v4/card_security/jwks
+  PLJWKS-->>CS: JWKS PLARD RSA-2048 + kid_plard
+
+  %% 2) CS llama dynamic_pek en PLARD (request JWE dentro de JWS)
+  %%    - CS NO arma payload en claro: le pasa el JWE del canal a cipher para producir un JWE hacia PLARD
+  %%    - Cipher firma JWS con llave privada (jws-private-kid en JKS)
+  CS->>CIPH: buildPlardDynamicPekJwsJwe\nInput:\n- inbound JWE(request) (del canal, sin abrir por CS)\n- kid_plard (public key de PLARD para cifrar JWE)\n- jws-private-kid (id de llave privada para firmar JWS)\n- schema=_Generate_pek_input_structure\nOutput:\n- JWSID_plard (JWS)\n- JWE_plard_dynamic_pek_request
+  CIPH-->>CS: JWSID_plard + JWE_plard_dynamic_pek_request
+
+  CS->>PL: POST /v4/card_security/dynamic_pek\nHeaders:\n- Authorization: JWSID_plard\n- input-encryption-public-kid: kid_plard\nBody: JWE_plard_dynamic_pek_request (application/jose)
+  PL-->>CS: JWE(dynamic_pek_response)\n(schema=_Generate_pek_output_structure)\nIncluye PEK + pek_token (cifrados)
+
+  %% 3) CS necesita PEK/pek_token pero NO puede abrirlos: se los pasa a cipher
+  %%    Cipher: abre respuesta PLARD, extrae PEK, y produce PINBLOCK cifrado con PEK.
+  CS->>CIPH: extractPekAndEncryptPinblock\nInput:\n- inbound JWE(request) del canal (para obtener PIN/PINBLOCK base)\n- JWE(dynamic_pek_response) de PLARD\n- (kid_nuestro para abrir inbound) + (kid_plard si aplica)\nOutput:\n- pinblock_encrypted_with_pek\n- pek_token / keyId (lo que PLARD pida en change_pin)
+  CIPH-->>CS: pinblock_encrypted_with_pek + pek_token
+
+  %% 4) CS arma request change_pin de PLARD (pero sin pinblock en claro; usa lo cifrado)
+  %%    El request hacia PLARD es JWE y va firmado con JWSID_plard (u otro)
+  CS->>CIPH: buildPlardChangePinJwsJwe\nInput:\n- card_id\n- pinblock_encrypted_with_pek\n- pek_token\n- kid_plard\n- jws-private-kid\n- schema=_change_pin_input_structure\nOutput:\n- JWSID_plard2\n- JWE_plard_change_pin_request
+  CIPH-->>CS: JWSID_plard2 + JWE_plard_change_pin_request
+
+  CS->>PL: POST /v4/card_security/{card_id}/change_pin\nHeaders:\n- Authorization: JWSID_plard2\n- input-encryption-public-kid: kid_plard\nBody: JWE_plard_change_pin_request (application/jose)
+  PL-->>CS: JWE(change_pin_response) (application/jose)\n(PLARD siempre responde JWE)
+
+  %% 5) CS devuelve al canal: respuesta siempre JWE con la publicKey efímera del canal
+  CS->>CIPH: reencryptPlardResponseForChannel\nInput:\n- JWE(change_pin_response) de PLARD\n- inbound JWE(request) (para extraer la publicKey efímera del canal)\nOutput:\n- JWE(response) para canal
+  CIPH-->>CS: JWE(response)
+  CS-->>GW: 200/4xx + Body=JWE(response)
+  GW-->>CH: 200/4xx + Body=JWE(response)
+
+end
+
+%% =========================================================
+%% NOTAS DE SEGURIDAD (implícitas en el diagrama)
+%% =========================================================
+Note over CS,CIPH: CS solo orquesta:\n- No descifra inbound JWE\n- No construye payload sensible en claro\n- No ve PIN/PINBLOCK en claro\nCipher es el único que:\n- Abre JWE\n- Produce PINBLOCK cifrado (dynKey LMPB o PEK PLARD)\n- Firma JWS (JWSID_plard) con llave privada en JKS\n- (Re)cifra respuestas al canal con su publicKey efímera
