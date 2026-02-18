@@ -1,0 +1,102 @@
+sequenceDiagram
+autonumber
+
+actor Channel as Canal_Cliente
+participant GW as API_Connect
+participant CS as sgt-carsec-cardsecuritymx
+participant CPL as sgt-cardpl-cardplacelocator
+participant Cipher as cipher-service
+
+participant MQIN as IBM_MQ_IN
+participant MQOUT as IBM_MQ_OUT
+participant Disp as Dispatcher_Service
+participant Redis as Redis_PubSub
+
+participant PLJWKS as PLARD_4_0_0_JWKS
+participant PLARD as PLARD_4_0_0_API
+
+%% =========================
+%% Entrada (fachada 4.1.2)
+%% =========================
+Channel->>GW: POST change_pin (JWE) + Authorization JWSID
+GW->>GW: validate JWSID
+GW->>CS: forward inbound_JWE + security context
+
+Note over CS: CS nunca abre inbound_JWE\nCS nunca ve PIN ni PINBLOCK en claro\nCipher procesa lo sensible
+
+%% =========================
+%% Resolver place usando card_id
+%% =========================
+CS->>CPL: resolvePlace(card_id)
+CPL-->>CS: place GRAVITY or PLARD
+
+alt place == GRAVITY
+
+  Note over CS,Disp: GRAVITY por TRX\nCS envia a MQ_IN\nCS se suscribe a Redis reply channel\nDispatcher escucha MQ_OUT y publica en Redis
+
+  %% Suscripcion a canal Redis por correlacion
+  CS->>Redis: SUBSCRIBE redis.reply.corrId
+
+  %% LMPB request hacia MQ IN
+  CS->>MQIN: TRX LMPB request (corrId, card_id)
+  MQIN->>MQIN: enqueue
+
+  %% Dispatcher escucha MQ OUT y publica a Redis
+  MQOUT-->>Disp: LMPB response (corrId, dynamicKey, keyId)
+  Disp->>Redis: PUBLISH redis.reply.corrId (dynamicKey, keyId)
+
+  %% CS recibe respuesta LMPB desde Redis
+  Redis-->>CS: dynamicKey + keyId
+
+  %% Cipher produce PINBLOCK cifrado con dynamicKey sin exponer claro a CS
+  CS->>Cipher: encryptPinblockWithDynamicKey\ninputs: inbound_JWE + dynamicKey
+  Cipher-->>CS: pinblock_encrypted_with_dynKey
+
+  %% LMPC request hacia MQ IN con pinblock cifrado y keyId
+  CS->>MQIN: TRX LMPC request (corrId2, card_id, pinblock_encrypted_with_dynKey, keyId)
+  MQIN->>MQIN: enqueue
+
+  %% Dispatcher publica respuesta LMPC en Redis
+  MQOUT-->>Disp: LMPC response (corrId2, status, code)
+  Disp->>Redis: PUBLISH redis.reply.corrId2 (status, code)
+
+  %% CS recibe respuesta LMPC
+  Redis-->>CS: status + code
+
+  %% Respuesta al canal siempre en JWE (Cipher extrae ephemeral key del inbound_JWE)
+  CS->>Cipher: encryptResponseForChannel\ninputs: status + code + inbound_JWE
+  Cipher-->>CS: outbound_JWE
+  CS-->>GW: outbound_JWE
+  GW-->>Channel: outbound_JWE
+
+else place == PLARD
+
+  Note over CS,PLARD: PLARD por API\nSin TRX\nSin Dispatcher\nPLARD siempre responde application_jose JWE
+
+  %% Obtener JWKS de PLARD
+  CS->>PLJWKS: GET jwks
+  PLJWKS-->>CS: kid_plard + plard_public_key
+
+  %% Dynamic PEK request JWS and JWE
+  CS->>Cipher: buildDynamicPekJwsJwe\ninputs: inbound_JWE + kid_plard + plard_public_key + signing_key_id
+  Cipher-->>CS: plard_auth_jws + jwe_dynamic_pek_req
+  CS->>PLARD: POST dynamic_pek\nheaders: Authorization plard_auth_jws, kid_plard\nbody: jwe_dynamic_pek_req
+  PLARD-->>CS: jwe_dynamic_pek_resp
+
+  %% Cipher extrae PEK y produce pinblock cifrado con PEK
+  CS->>Cipher: extractPekAndEncryptPinblock\ninputs: inbound_JWE + jwe_dynamic_pek_resp
+  Cipher-->>CS: pinblock_encrypted_with_pek + pek_token
+
+  %% Build change_pin request con _change_pin_input_structure
+  CS->>Cipher: buildChangePinJwsJwe\ninputs: card_id + pinblock_encrypted_with_pek + pek_token\n+ kid_plard + plard_public_key + signing_key_id
+  Cipher-->>CS: plard_auth_jws_2 + jwe_change_pin_req
+  CS->>PLARD: POST change_pin\nheaders: Authorization plard_auth_jws_2, kid_plard\nbody: jwe_change_pin_req
+  PLARD-->>CS: jwe_change_pin_resp
+
+  %% Reencrypt respuesta PLARD al canal como JWE
+  CS->>Cipher: reencryptPlardResponseForChannel\ninputs: jwe_change_pin_resp + inbound_JWE
+  Cipher-->>CS: outbound_JWE
+  CS-->>GW: outbound_JWE
+  GW-->>Channel: outbound_JWE
+
+end
