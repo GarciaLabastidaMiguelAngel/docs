@@ -1,0 +1,133 @@
+sequenceDiagram
+autonumber
+
+actor U as User/Channel
+participant GW as API_Connect_GW
+participant MS as API_CustomerSegmentations_Micro
+participant DB as Exadata_Oracle (JDBC)
+participant MQIN as IBM_MQ_IN
+participant CORE as Gravity_Core (Banking Core)
+participant MQOUT as IBM_MQ_OUT
+participant DISP as Dispatcher_Service
+participant Redis as Redis (Pub/Sub)
+
+%% =========================================================
+%% BOOTSTRAP (inicialización de componentes)
+%% =========================================================
+Note over MS,Redis: BOOTSTRAP Micro\n1) Determina channelName (por env/env+api)\n2) SUBSCRIBE a canal Redis\n3) Mantiene correlationId -> promise/future
+
+MS->>Redis: SUBSCRIBE segm.responses.channel
+
+Note over DISP,MQOUT: BOOTSTRAP Dispatcher\n1) Consume MQ OUT continuamente\n2) Extrae correlationId\n3) Publica en Redis al canal correspondiente
+
+DISP->>MQOUT: START_CONSUMER()
+
+%% =========================================================
+%% REQUEST (HTTP)
+%% =========================================================
+U->>GW: GET /v1/customer_segmentation/{customer_id}\nHeaders:\n- Authorization: JWSID\n- x-santander-client-id\n- x-correlation-id\nQuery:\n- segmentation_code (opcional)
+
+Note over GW: Seguridad Gateway (JWSID)\n- Verifica firma (kid)\n- exp/iat/nbf\n- aud/iss\n- scopes/roles\n- correlation-id requerido
+
+alt JWSID inválido / no autorizado
+  GW-->>U: 401 / 403
+else JWSID OK
+  GW->>MS: Forward Request\n(+identity context + correlationId)
+
+  Note over MS: Validaciones Micro (funcionales)\n- customer_id presente/formato\n- segmentation_code permitido\n- headers requeridos\n- correlationId obligatorio
+
+  alt Error de validación
+    MS-->>GW: 400 Bad Request
+    GW-->>U: 400
+  else OK
+
+    %% =========================================================
+    %% DDF (JDBC directo)
+    %% =========================================================
+    Note over MS,DB: DDF PE6A (Consulta JDBC)\nNo usa MQ / No usa Dispatcher\nObjetivo: obtener datos base + Aux.TIPPER (entre otros)
+
+    MS->>DB: JDBC Query DDF_PE6A(customer_id, segmentation_code)
+    alt DDF sin información / KO
+      DB-->>MS: Empty/KO
+      MS-->>GW: 500 Not return information
+      GW-->>U: 500
+    else DDF OK
+      DB-->>MS: ResultSet (incluye Aux.TIPPER)
+
+      %% =========================================================
+      %% Reglas de negocio que disparan TRX
+      %% =========================================================
+      Note over MS: Evaluación de reglas\nA) si segmentation_code == "CM" o EMPTY/NULL -> TRX TCGG\nB) si (segmentation_code == "IN" o "IC" o EMPTY/NULL) y Aux.TIPPER == "J" -> TRX PEL1\nC) si (segmentation_code == "IN" o "IC" o EMPTY/NULL) y Aux.TIPPER == "F" -> TRX PEL2\n(Se agregan descripciones/catálogos a la respuesta final)
+
+      %% ---------- TRX TCGG ----------
+      alt Regla A aplica (CM o vacío)
+        Note over MS,MQIN: Envío TRX TCGG vía MQ IN\n- payload TRX\n- correlationId\n- reply-to lógico (en header)\n- canalRedisDestino = segm.responses.channel
+
+        MS->>MQIN: PUT message TRX_TCGG\n(correlationId, payload)
+        MQIN->>CORE: Deliver TRX_TCGG
+        CORE->>MQOUT: Produce response TRX_TCGG\n(correlationId, code, body)
+
+        Note over DISP,Redis: Dispatcher enruta respuesta\nMQ OUT -> Redis Publish (según correlationId/canal)
+
+        DISP->>MQOUT: CONSUME response (correlationId)
+        DISP->>Redis: PUBLISH segm.responses.channel\n(correlationId, TRX_TCGG response)
+
+        Redis-->>MS: Deliver pubsub message\n(correlationId, response)
+        alt Respuesta TCGG OK\n(ResponseCode: TCA0006 FIN DE DATOS / OK esperado)
+          MS->>MS: Enriquecer descripciones/catálogos\ncon datos de TCGG
+        else Respuesta TCGG KO
+          MS-->>GW: 500 Error (TCGG KO)
+          GW-->>U: 500
+        end
+      else Regla A no aplica
+        Note over MS: Se omite TRX TCGG
+      end
+
+      %% ---------- TRX PEL1 ----------
+      alt Regla B aplica (IN/IC o vacío) y Aux.TIPPER == "J"
+        MS->>MQIN: PUT message TRX_PEL1\n(correlationId, payload)
+        MQIN->>CORE: Deliver TRX_PEL1
+        CORE->>MQOUT: Produce response TRX_PEL1\n(correlationId, code, body)
+        DISP->>MQOUT: CONSUME response (correlationId)
+        DISP->>Redis: PUBLISH segm.responses.channel\n(correlationId, TRX_PEL1 response)
+        Redis-->>MS: Deliver pubsub message\n(correlationId, response)
+
+        alt Respuesta PEL1 OK\n(ResponseCode: ODA0029 OK, CONSULTA EXITOSA)
+          MS->>MS: Enriquecer descripciones/catálogos\ncon datos de PEL1
+        else Respuesta PEL1 KO
+          MS-->>GW: 500 Error (PEL1 KO)
+          GW-->>U: 500
+        end
+      else Regla B no aplica
+        Note over MS: Se omite TRX PEL1
+      end
+
+      %% ---------- TRX PEL2 ----------
+      alt Regla C aplica (IN/IC o vacío) y Aux.TIPPER == "F"
+        MS->>MQIN: PUT message TRX_PEL2\n(correlationId, payload)
+        MQIN->>CORE: Deliver TRX_PEL2
+        CORE->>MQOUT: Produce response TRX_PEL2\n(correlationId, code, body)
+        DISP->>MQOUT: CONSUME response (correlationId)
+        DISP->>Redis: PUBLISH segm.responses.channel\n(correlationId, TRX_PEL2 response)
+        Redis-->>MS: Deliver pubsub message\n(correlationId, response)
+
+        alt Respuesta PEL2 OK\n(ResponseCode: ODA0029 OK, CONSULTA EXITOSA)
+          MS->>MS: Enriquecer descripciones/catálogos\ncon datos de PEL2
+        else Respuesta PEL2 KO
+          MS-->>GW: 500 Error (PEL2 KO)
+          GW-->>U: 500
+        end
+      else Regla C no aplica
+        Note over MS: Se omite TRX PEL2
+      end
+
+      %% =========================================================
+      %% RESPUESTA FINAL
+      %% =========================================================
+      Note over MS: Construcción de Response 200\n- segmentations[] enriquecido\n- segmentDescription / segmentCode\n- coherencia con reglas aplicadas
+
+      MS-->>GW: 200 OK + JSON response
+      GW-->>U: 200 OK
+    end
+  end
+end
