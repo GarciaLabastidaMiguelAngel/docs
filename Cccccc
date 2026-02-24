@@ -1,57 +1,75 @@
 sequenceDiagram
 autonumber
 
-actor U as User
+actor U as User/Channel
 participant GW as API_Connect_GW
-participant MS as sgt_accounts_convertidentifiers
-participant IAM as IAM_STS
-participant DB as Exadata_Oracle_JDBC
+participant MS as sgt-customers-deposittransactions
+participant PKM as Public_Key_Management
+participant MQIN as MQ_IN
+participant CORE as Core_Gravity
+participant MQOUT as MQ_OUT
+participant DISP as Dispatcher_Service
 
-%% ===============================
+%% =========================================
 %% BOOTSTRAP
-%% ===============================
+%% =========================================
 Note over MS: BOOTSTRAP (startup)
 
-MS->>MS: Load config
-MS->>IAM: Fetch JWKS
-IAM-->>MS: JWKS OK
-MS->>MS: Init crypto providers
-MS->>MS: Init observability
-MS->>DB: Warmup JDBC pool
-DB-->>MS: OK
-Note over MS: Ready
+MS->>MS: Load config (env/secrets, client allowlist)
+MS->>PKM: Fetch JWKS (issuer public keys)
+PKM-->>MS: JWKS (public keys + kid)
+MS->>MS: Cache JWKS (in-memory)
+MS->>MS: Init crypto providers (JCA hardened)
+MS->>MS: Init observability (audit, tracing, metrics)
+MS->>DISP: Subscribe to Redis channel (correlationId)
+Note over MS: Ready (liveness/readiness OK)
 
-%% ===============================
+%% =========================================
 %% REQUEST FLOW
-%% ===============================
-U->>GW: POST /v5/accounts/convert_identifiers
+%% =========================================
 
-GW->>GW: Validate JWSID
+U->>GW: GET /term_deposit_transactions/{depositId}/placements/{placementId}/transactions
+Note over GW: Security at Gateway\n- TLS/mTLS\n- OAuth2 validation\n- JWSID validation\n- clientId validation\n- Rate limiting
 
-alt JWSID invalid
-    GW-->>U: 401 Unauthorized
-else JWSID valid
-    GW->>MS: Forward request
+GW->>MS: Forward request (validated)
 
-    MS->>MS: Validate input data
+%% -----------------------------------------
+%% SECURITY @ MICROSERVICE
+%% -----------------------------------------
 
-    alt Validation error
+MS->>MS: Validate JWSID signature (using cached JWKS)
+MS->>MS: Validate exp, nbf, aud, iss
+MS->>MS: Validate clientId allowlist
+
+alt Security validation fails
+    MS-->>GW: 401 Unauthorized
+    GW-->>U: 401
+else Security OK
+
+    MS->>MS: Validate path & input parameters
+
+    alt Input validation error
         MS-->>GW: 400 Bad Request
         GW-->>U: 400
-    else Validation OK
+    else Input OK
 
-        MS->>DB: Execute B485_DDF_019
+        %% -----------------------------------------
+        %% CORE TRANSACTION FLOW (Gravity)
+        %% -----------------------------------------
 
-        alt DDF business error
-            DB-->>MS: No data / rule error
-            MS-->>GW: 400
+        MS->>MQIN: Publish TRX_BD32 (with correlationId)
+        MQIN->>CORE: Deliver transaction to Core
+        CORE-->>MQOUT: Transaction response
+        MQOUT->>DISP: Dispatcher listening
+        DISP->>MS: Publish response to Redis channel
+
+        alt Business error from Core
+            MS-->>GW: 400 Business Error
             GW-->>U: 400
-        else DDF technical error
-            DB-->>MS: SQL error
-            MS-->>GW: 500
+        else Technical error
+            MS-->>GW: 500 Internal Error
             GW-->>U: 500
-        else DDF OK
-            DB-->>MS: Converted identifiers
+        else Success
             MS-->>GW: 200 OK
             GW-->>U: 200 OK
         end
