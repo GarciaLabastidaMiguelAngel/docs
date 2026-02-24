@@ -3,77 +3,79 @@ autonumber
 
 actor U as User/Channel
 participant GW as API_Connect_GW
-participant MS as sgt-customers-deposittransactions
-participant PKM as Public_Key_Management
-participant MQIN as MQ_IN
-participant CORE as Core_Gravity
-participant MQOUT as MQ_OUT
+participant MS as API_Cards_Microservice
+participant PKM as PKM (Public Key Management)
+participant LOC as CardPlaceLocator
+participant ANON as Anonymizer_API
+participant MQIN as IBM_MQ_IN
+participant CORE as Core_Gravity (Bank Core)
+participant MQOUT as IBM_MQ_OUT
 participant DISP as Dispatcher_Service
+participant PLARD as Plard_API
 
-%% =========================================
-%% BOOTSTRAP
-%% =========================================
+%% =========================================================
+%% BOOTSTRAP / STARTUP
+%% =========================================================
+rect rgba(230,230,230,0.35)
 Note over MS: BOOTSTRAP (startup)
-
-MS->>MS: Load config (env/secrets, client allowlist)
+MS->>MS: Load config/secrets\n- clientId allowlist\n- Redis channel prefix\n- MQ params\n- timeouts/retries\n- PKM issuer/audience
 MS->>PKM: Fetch JWKS (issuer public keys)
-PKM-->>MS: JWKS (public keys + kid)
-MS->>MS: Cache JWKS (in-memory)
-MS->>MS: Init crypto providers (JCA hardened)
-MS->>MS: Init observability (audit, tracing, metrics)
-MS->>DISP: Subscribe to Redis channel (correlationId)
-Note over MS: Ready (liveness/readiness OK)
+PKM-->>MS: JWKS (kid -> publicKey)
+MS->>MS: Cache JWKS in-memory\n(refresh/rotation)
+MS->>MS: Init crypto providers + observability\n(tracing/metrics/audit)
+MS->>MS: Redis SUBSCRIBE\nchannel = redis:trx:reply:<ms-instance>
+MS->>MQIN: MQ connectivity check / health
+Note over DISP: Dispatcher already running
+DISP->>MQOUT: BOOTSTRAP subscribe/consume\n(from MQ OUT queue/topic)
+end
 
-%% =========================================
+%% =========================================================
 %% REQUEST FLOW
-%% =========================================
+%% =========================================================
+U->>GW: GET /card_transactions?... (card_id, params)\nHeaders: Authorization(JWSID/JWT), x-santander-client-id
+Note over GW: SECURITY @ GATEWAY\n1) TLS/mTLS (si aplica)\n2) Validate token signature (PKM JWKS)\n3) Validate claims: iss/aud/exp/nbf\n4) Validate client-id allowlist\n5) Rate limit / WAF / threat protections
+GW->>MS: Forward request\n+ propagated correlation-id\n+ validated principal/claims (según estándar interno)
 
-U->>GW: GET /term_deposit_transactions/{depositId}/placements/{placementId}/transactions
-Note over GW: Security at Gateway\n- TLS/mTLS\n- OAuth2 validation\n- JWSID validation\n- clientId validation\n- Rate limiting
+Note over MS: App-level security (defensa en profundidad)\n- re-validate mandatory claims\n- validate scopes/entitlements\n- input validation
 
-GW->>MS: Forward request (validated)
+MS->>LOC: Resolve card location by card_id
+LOC-->>MS: location = PAMPA | PLARD
 
-%% -----------------------------------------
-%% SECURITY @ MICROSERVICE
-%% -----------------------------------------
+alt location == PAMPA (Gravity / TRX path)
+    Note over MS: PAMPA requiere PAN\n=> desanonimizar CARID -> PAN (NO es DDF)
+    MS->>ANON: De-anonymize(card_id)\n(authn between services)
+    ANON-->>MS: PAN
 
-MS->>MS: Validate JWSID signature (using cached JWKS)
-MS->>MS: Validate exp, nbf, aud, iss
-MS->>MS: Validate clientId allowlist
+    Note over MS: Build TRX request\n- includes PAN + filters/pagination
+    MS->>MQIN: Put message(TRX=LWMK/LMWK...)\nheaders: msgId, correlationId, replyTo=MQOUT\nbody: request payload
+    MQIN-->>CORE: Deliver TRX request
+    CORE-->>MQOUT: TRX response\n(correlationId, status, payload/error)
 
-alt Security validation fails
-    MS-->>GW: 401 Unauthorized
-    GW-->>U: 401
-else Security OK
+    Note over DISP: Dispatcher consumes MQ OUT\nand publishes to Redis channel based on correlationId mapping
+    DISP->>MQOUT: Consume response (listener)
+    DISP->>DISP: Resolve target channel\n(channel = redis:trx:reply:<ms-instance>)
+    DISP->>MS: Publish to Redis channel\n(payload + correlationId)
 
-    MS->>MS: Validate path & input parameters
+    Note over MS: MS is subscribed since bootstrap\nWait by correlationId (async->sync bridge)
+    MS-->>MS: Match correlationId\nassemble API response DTO
 
-    alt Input validation error
-        MS-->>GW: 400 Bad Request
-        GW-->>U: 400
-    else Input OK
-
-        %% -----------------------------------------
-        %% CORE TRANSACTION FLOW (Gravity)
-        %% -----------------------------------------
-
-        MS->>MQIN: Publish TRX_BD32 (with correlationId)
-        MQIN->>CORE: Deliver transaction to Core
-        CORE-->>MQOUT: Transaction response
-        MQOUT->>DISP: Dispatcher listening
-        DISP->>MS: Publish response to Redis channel
-
-        alt Business error from Core
-            MS-->>GW: 400 Business Error
-            GW-->>U: 400
-        else Technical error
-            MS-->>GW: 500 Internal Error
-            GW-->>U: 500
-        else Success
-            MS-->>GW: 200 OK
-            GW-->>U: 200 OK
-        end
-
+    alt TRX error / timeout
+        MS-->>GW: Error 4xx/5xx mapped\n(include error code + correlationId)
+        GW-->>U: Error response
+    else TRX OK
+        MS-->>GW: 200/206 response
+        GW-->>U: Response
     end
 
+else location == PLARD (API path)
+    Note over MS: PLARD se consume por API REST\nNO hay MQ/Dispatcher/Redis PubSub aquí
+    %% (Si aplica) desanonimización sólo si PLARD requiere PAN.\n(Si PLARD trabaja por card_id, se omite.)
+    MS->>PLARD: GET /v3/card_transactions/transactions\n(params)\nHeaders: auth between services
+    alt PLARD error
+        MS-->>GW: Error 4xx/5xx mapped\n(include correlationId)
+        GW-->>U: Error response
+    else PLARD OK
+        MS-->>GW: 200/206 response
+        GW-->>U: Response
+    end
 end
