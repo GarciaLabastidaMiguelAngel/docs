@@ -1,76 +1,61 @@
 sequenceDiagram
 autonumber
 
-actor U as User/Channel
+actor U as User
 participant GW as API_Connect_GW
-participant MS as sgt-accounts-convertidentifiers (Microservice)
-participant IAM as IAM/STS (Introspection/JWKS/Policy) 
-participant DB as Exadata_Oracle (JDBC)
+participant MS as sgt_accounts_convertidentifiers
+participant IAM as IAM_STS
+participant DB as Exadata_Oracle_JDBC
 
-%% =========================================================
-%% BOOTSTRAP (startup)
-%% =========================================================
+%% ===============================
+%% BOOTSTRAP
+%% ===============================
 Note over MS: BOOTSTRAP (startup)
 
-MS->>MS: Load config (env/secret)\n- clientId allowlist\n- DB pool config\n- timeouts/retries\n- validation rules
-MS->>IAM: Fetch/refresh JWKS (issuer keys)\n(cache in-memory + rotation schedule)
-IAM-->>MS: JWKS (public keys + kid)
-MS->>MS: Init crypto providers\n- JCA providers\n- disable weak algs\n- secure random
-MS->>MS: Init observability\n- tracing\n- metrics\n- audit logger
-MS->>DB: Warmup JDBC pool / healthcheck
+MS->>MS: Load config
+MS->>IAM: Fetch JWKS
+IAM-->>MS: JWKS OK
+MS->>MS: Init crypto providers
+MS->>MS: Init observability
+MS->>DB: Warmup JDBC pool
 DB-->>MS: OK
-Note over MS: Ready (liveness/ readiness = OK)
+Note over MS: Ready
 
-%% =========================================================
+%% ===============================
 %% REQUEST FLOW
-%% =========================================================
-U->>GW: POST /v5/accounts/convert_identifiers\nHeaders:\n- Authorization: JWSID\n- x-santander-client-id\n- x-correlation-id\nBody: accounts[]
+%% ===============================
+U->>GW: POST /v5/accounts/convert_identifiers
 
-%% ---------------- SECURITY @ GATEWAY ----------------
-Note over GW: Seguridad (Gateway)\n1) TLS/mTLS (si aplica)\n2) Validar JWSID:\n   - signature por kid (JWKS)\n   - exp/iat/nbf\n   - iss/aud\n   - scope/roles\n3) Rate-limit / WAF\n4) Correlation-id (crear si falta)
+GW->>GW: Validate JWSID
 
-alt JWSID ausente / inválido
-  GW-->>U: 401 Unauthorized
-else JWSID válido pero sin permisos
-  GW-->>U: 403 Forbidden
-else OK
-  GW->>MS: Forward request\n(+claims mínimos + correlationId)\nHeaders preserved
+alt JWSID invalid
+    GW-->>U: 401 Unauthorized
+else JWSID valid
+    GW->>MS: Forward request
 
-  %% ---------------- SECURITY @ MICROSERVICE ----------------
-  Note over MS: Seguridad (Micro - defensa en profundidad)\nA) Re-validar JWSID (opcional pero recomendado):\n   - firma/exp/iss/aud\n   - x-santander-client-id vs claim/allowlist\nB) Input hardening:\n   - size limits (accounts[])\n   - JSON schema\n   - sanitización\nC) Audit trail (sin datos sensibles)\nD) Timeouts/circuit breaker DB
-
-  alt Validación headers/context falla
-    MS-->>GW: 401/403
-    GW-->>U: 401/403
-  else OK
-
-    %% ---------------- INPUT VALIDATION ----------------
-    Note over MS: Validate input data\n- accounts[] obligatorio y no vacío\n- cada elemento: accountIdentification\n- formatos/longitudes\n- límites (max accounts)\n- no duplicados (si regla aplica)
+    MS->>MS: Validate input data
 
     alt Validation error
-      MS-->>GW: 400 Bad Request (validation)
-      GW-->>U: 400
-    else OK
+        MS-->>GW: 400 Bad Request
+        GW-->>U: 400
+    else Validation OK
 
-      %% =========================================================
-      %% DDF JDBC DIRECT
-      %% =========================================================
-      Note over MS,DB: DDF = JDBC directo (NO TRX / NO MQ / NO Dispatcher / NO Redis)\nB485_DDF_019
+        MS->>DB: Execute B485_DDF_019
 
-      MS->>DB: JDBC Query B485_DDF_019(accounts[])
-      alt DDF returns "no data" / business rule
-        DB-->>MS: KO (mapped to 4xx)
-        MS-->>GW: 400 (o 404 si está definido así)
-        GW-->>U: 400/404
-      else DB technical error
-        DB-->>MS: SQL/Timeout/Conn error
-        MS-->>GW: 500 (o 504 si timeout)
-        GW-->>U: 500/504
-      else DDF OK
-        DB-->>MS: OK + converted identifiers
-        MS-->>GW: 200 OK + response
-        GW-->>U: 200 OK
-      end
+        alt DDF business error
+            DB-->>MS: No data / rule error
+            MS-->>GW: 400
+            GW-->>U: 400
+        else DDF technical error
+            DB-->>MS: SQL error
+            MS-->>GW: 500
+            GW-->>U: 500
+        else DDF OK
+            DB-->>MS: Converted identifiers
+            MS-->>GW: 200 OK
+            GW-->>U: 200 OK
+        end
 
-  end
+    end
+
 end
