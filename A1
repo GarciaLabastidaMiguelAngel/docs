@@ -1,136 +1,81 @@
 stateDiagram-v2
-  [*] --> CASE_NOT_FOUND
+    [*] --> CASE_NOT_FOUND
 
-  %% ==============
-  %% Inbound: /activar-reporte
-  %% ==============
-  CASE_NOT_FOUND --> CASE_RECEIVED : IN_ACTIVATE_REPORT / action: createCase(id,curp),auditInbound
-  CASE_RECEIVED --> IN_AUTH_VALIDATED : IN_JWT_OK / action: auditAuthOK
-  CASE_RECEIVED --> IN_AUTH_ERROR : IN_JWT_FAIL / action: auditAuthFail
+    %% =============================
+    %% INBOUND ACTIVATION
+    %% =============================
+    CASE_NOT_FOUND --> CASE_RECEIVED : IN_ACTIVATE_REPORT / createCase
+    CASE_RECEIVED --> CASE_AUTH_OK : IN_JWT_OK
+    CASE_RECEIVED --> CASE_AUTH_ERROR : IN_JWT_FAIL
 
-  state IN_AUTH_ERROR {
-    [*] --> IN_401 : IN_TOKEN_INVALID_OR_EXPIRED
-    IN_401 --> [*]
-  }
+    CASE_AUTH_ERROR --> [*]
 
-  IN_AUTH_VALIDATED --> VALIDATING_PAYLOAD : VALIDATE_ACTIVATE / action: validateRequired(id,curp),validateUTF8
-  VALIDATING_PAYLOAD --> ACTIVATE_REJECTED_400 : PAYLOAD_INVALID / action: auditValidationFail,respond400
-  VALIDATING_PAYLOAD --> CASE_ACTIVE : PAYLOAD_OK / action: auditValidationOK,respond200
+    CASE_AUTH_OK --> CASE_ACTIVE : PAYLOAD_OK
+    CASE_AUTH_OK --> CASE_REJECTED : PAYLOAD_INVALID
+    CASE_REJECTED --> [*]
 
-  %% ==============
-  %% Master state for an active case (per-person)
-  %% ==============
-  state CASE_ACTIVE {
+    %% =============================
+    %% CASE ACTIVE (MASTER STATE)
+    %% =============================
+    state CASE_ACTIVE {
 
-    %% --- Fork: Phase12 and Continuous in parallel
-    state START_PARALLEL <<fork>>
-    [*] --> START_PARALLEL
-    START_PARALLEL --> REGION_PHASE12
-    START_PARALLEL --> REGION_CONTINUOUS
+        [*] --> PARALLEL_START
 
-    %% ==========================
-    %% Region A: Phase 1 + Phase 2
-    %% ==========================
-    state REGION_PHASE12 {
+        state PARALLEL_START <<fork>>
+        PARALLEL_START --> PHASE12
+        PARALLEL_START --> CONTINUOUS
 
-      [*] --> P1_PENDING
+        %% -------------------------
+        %% REGION PHASE 1 + 2
+        %% -------------------------
+        state PHASE12 {
 
-      %% Phase 1 (inmediate/basic data)
-      P1_PENDING --> P1_RUNNING : P1_START / action: runImmediateSearch
-      P1_RUNNING --> P1_NO_DATA : P1_NO_HITS / action: auditP1NoData
-      P1_RUNNING --> P1_HAS_DATA : P1_HAS_DATA / action: buildP1Payload
+            [*] --> P1_RUNNING
 
-      %% Outbound token mgmt for calling PUI
-      P1_HAS_DATA --> OUT_TOKEN_READY : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
-      OUT_TOKEN_READY --> P1_NOTIFYING : OUT_NOTIFY_P1 / action: outboxEnqueue(notificar,phase=1)
-      P1_NOTIFYING --> P1_NOTIFIED : OUT_HTTP_200 / action: auditOutOk,markOutboxSent
-      P1_NOTIFYING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
-      P1_NOTIFYING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
-      P1_NOTIFYING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
+            P1_RUNNING --> P1_NOTIFY : P1_HAS_DATA
+            P1_RUNNING --> P1_DONE : P1_NO_DATA
 
-      P1_NO_DATA --> P1_DONE : P1_DONE
-      P1_NOTIFIED --> P1_DONE : P1_DONE
+            P1_NOTIFY --> P1_DONE : OUT_HTTP_200
 
-      %% Phase 2 decision (skip if fecha_desaparicion is empty/null)
-      P1_DONE --> P2_DECIDE : P2_EVALUATE
-      state P2_DECIDE <<choice>>
-      P2_DECIDE --> P2_SKIPPED : [guard: fechaDesaparicionNull] / action: auditP2Skipped,computeWindow(today..today)
-      P2_DECIDE --> P2_RUNNING : [guard: else] / action: computeWindow(max12Years),startHistoricalAsync
+            P1_DONE --> P2_DECISION
 
-      %% Phase 2 run/hits (each hit => notify phase=2)
-      P2_RUNNING --> P2_HIT_READY : P2_HIT / action: buildP2Payload(includeEventoFields)
-      P2_HIT_READY --> OUT_TOKEN_READY_2 : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
-      OUT_TOKEN_READY_2 --> P2_NOTIFYING : OUT_NOTIFY_P2 / action: outboxEnqueue(notificar,phase=2)
-      P2_NOTIFYING --> P2_RUNNING : OUT_HTTP_200 / action: auditOutOk,markOutboxSent,continueSearch
-      P2_NOTIFYING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
-      P2_NOTIFYING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
-      P2_NOTIFYING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
+            state P2_DECISION <<choice>>
+            P2_DECISION --> P2_SKIPPED : fechaDesaparicionNull
+            P2_DECISION --> P2_RUNNING : else
 
-      %% Phase 2 completion => MUST call /busqueda-finalizada always
-      P2_RUNNING --> P2_FINISHING : P2_DONE / action: auditP2Done
-      P2_SKIPPED --> P2_FINISHING : P2_SKIP_DONE / action: auditP2Done
+            P2_RUNNING --> P2_NOTIFY : P2_HIT
+            P2_NOTIFY --> P2_RUNNING : OUT_HTTP_200
 
-      P2_FINISHING --> OUT_TOKEN_READY_F : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
-      OUT_TOKEN_READY_F --> P2_FINALIZADA_SENDING : OUT_FINALIZADA / action: outboxEnqueue(busquedaFinalizada)
-      P2_FINALIZADA_SENDING --> PHASE12_COMPLETED : OUT_HTTP_200 / action: auditFinalizadaOk,markOutboxSent
-      P2_FINALIZADA_SENDING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
-      P2_FINALIZADA_SENDING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
-      P2_FINALIZADA_SENDING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
+            P2_RUNNING --> P2_FINALIZING : P2_DONE
+            P2_SKIPPED --> P2_FINALIZING
 
-      PHASE12_COMPLETED --> [*]
+            P2_FINALIZING --> PHASE12_DONE : OUT_FINALIZADA_OK
+            PHASE12_DONE --> [*]
+        }
+
+        %% -------------------------
+        %% REGION CONTINUOUS (PHASE 3)
+        %% -------------------------
+        state CONTINUOUS {
+
+            [*] --> C_ACTIVE
+
+            C_ACTIVE --> C_NOTIFY : C_MATCH
+            C_NOTIFY --> C_ACTIVE : OUT_HTTP_200
+
+            C_ACTIVE --> C_DEACTIVATING : IN_DEACTIVATE_REPORT
+            C_DEACTIVATING --> C_STOPPED : DEACT_OK
+            C_STOPPED --> [*]
+        }
+
+        %% -------------------------
+        %% JOIN
+        %% -------------------------
+        state END_JOIN <<join>>
+        PHASE12 --> END_JOIN
+        CONTINUOUS --> END_JOIN
+        END_JOIN --> [*]
     }
 
-    %% ==========================
-    %% Region B: Phase 3 Continuous (until /desactivar-reporte)
-    %% ==========================
-    state REGION_CONTINUOUS {
-
-      [*] --> C_ENABLING
-      C_ENABLING --> C_ACTIVE : C_START / action: registerInContinuousSystem,schedulePolling,auditCEnabled
-
-      %% periodic detection of new/modified records
-      C_ACTIVE --> C_MATCH_READY : C_MATCH_FOUND / action: buildP3Payload(includeEventoFields)
-      C_MATCH_READY --> OUT_TOKEN_READY_3 : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
-      OUT_TOKEN_READY_3 --> C_NOTIFYING : OUT_NOTIFY_P3 / action: outboxEnqueue(notificar,phase=3)
-      C_NOTIFYING --> C_ACTIVE : OUT_HTTP_200 / action: auditOutOk,markOutboxSent
-      C_NOTIFYING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
-      C_NOTIFYING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
-      C_NOTIFYING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
-
-      %% inbound: /desactivar-reporte
-      C_ACTIVE --> C_DEACT_REQUESTED : IN_DEACTIVATE_REPORT / action: auditInbound,stopScheduling
-      C_DEACT_REQUESTED --> C_DEACT_DONE : DEACT_OK / action: purgeCaseInternalState,auditCDisabled,respond200
-      C_DEACT_REQUESTED --> C_DEACT_AUTH_ERROR : IN_JWT_FAIL / action: auditAuthFail,respond401
-
-      C_DEACT_AUTH_ERROR --> C_ACTIVE : RESUME
-      C_DEACT_DONE --> [*]
-    }
-
-    %% Join: machine can terminate when continuous stopped AND phase12 ended
-    state END_JOIN <<join>>
-    REGION_PHASE12 --> END_JOIN
-    REGION_CONTINUOUS --> END_JOIN
-    END_JOIN --> [*]
-  }
-
-  CASE_ACTIVE --> CASE_CLOSED : MACHINE_TERMINATED / action: auditCaseClosed
-  CASE_CLOSED --> [*]
-
-  %% ======================
-  %% Outbound error substates (shared conceptual)
-  %% ======================
-  state OUT_AUTH_401 {
-    [*] --> OUT_REFRESH_TOKEN : OUT_RETRY / action: refreshToken(now),resendOutbox
-    OUT_REFRESH_TOKEN --> OUT_BACKOFF : TOKEN_OK / action: scheduleRetryWithBackoff
-    OUT_BACKOFF --> [*]
-  }
-
-  state OUT_TIMEOUT_504 {
-    [*] --> OUT_BACKOFF_504 : OUT_RETRY / action: scheduleRetryWithBackoff
-    OUT_BACKOFF_504 --> [*]
-  }
-
-  state OUT_ERROR_5XX {
-    [*] --> OUT_BACKOFF_5XX : OUT_RETRY / action: scheduleRetryWithBackoff
-    OUT_BACKOFF_5XX --> [*]
-  }
+    CASE_ACTIVE --> CASE_CLOSED : MACHINE_TERMINATED
+    CASE_CLOSED --> [*]
