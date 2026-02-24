@@ -1,133 +1,136 @@
-sequenceDiagram
-autonumber
+stateDiagram-v2
+  [*] --> CASE_NOT_FOUND
 
-actor U as User/Channel
-participant GW as API_Connect_GW
-participant MS as API_CustomerSegmentations_Micro
-participant DB as Exadata_Oracle (JDBC)
-participant MQIN as IBM_MQ_IN
-participant CORE as Gravity_Core (Banking Core)
-participant MQOUT as IBM_MQ_OUT
-participant DISP as Dispatcher_Service
-participant Redis as Redis (Pub/Sub)
+  %% ==============
+  %% Inbound: /activar-reporte
+  %% ==============
+  CASE_NOT_FOUND --> CASE_RECEIVED : IN_ACTIVATE_REPORT / action: createCase(id,curp),auditInbound
+  CASE_RECEIVED --> IN_AUTH_VALIDATED : IN_JWT_OK / action: auditAuthOK
+  CASE_RECEIVED --> IN_AUTH_ERROR : IN_JWT_FAIL / action: auditAuthFail
 
-%% =========================================================
-%% BOOTSTRAP (inicialización de componentes)
-%% =========================================================
-Note over MS,Redis: BOOTSTRAP Micro\n1) Determina channelName (por env/env+api)\n2) SUBSCRIBE a canal Redis\n3) Mantiene correlationId -> promise/future
+  state IN_AUTH_ERROR {
+    [*] --> IN_401 : IN_TOKEN_INVALID_OR_EXPIRED
+    IN_401 --> [*]
+  }
 
-MS->>Redis: SUBSCRIBE segm.responses.channel
+  IN_AUTH_VALIDATED --> VALIDATING_PAYLOAD : VALIDATE_ACTIVATE / action: validateRequired(id,curp),validateUTF8
+  VALIDATING_PAYLOAD --> ACTIVATE_REJECTED_400 : PAYLOAD_INVALID / action: auditValidationFail,respond400
+  VALIDATING_PAYLOAD --> CASE_ACTIVE : PAYLOAD_OK / action: auditValidationOK,respond200
 
-Note over DISP,MQOUT: BOOTSTRAP Dispatcher\n1) Consume MQ OUT continuamente\n2) Extrae correlationId\n3) Publica en Redis al canal correspondiente
+  %% ==============
+  %% Master state for an active case (per-person)
+  %% ==============
+  state CASE_ACTIVE {
 
-DISP->>MQOUT: START_CONSUMER()
+    %% --- Fork: Phase12 and Continuous in parallel
+    state START_PARALLEL <<fork>>
+    [*] --> START_PARALLEL
+    START_PARALLEL --> REGION_PHASE12
+    START_PARALLEL --> REGION_CONTINUOUS
 
-%% =========================================================
-%% REQUEST (HTTP)
-%% =========================================================
-U->>GW: GET /v1/customer_segmentation/{customer_id}\nHeaders:\n- Authorization: JWSID\n- x-santander-client-id\n- x-correlation-id\nQuery:\n- segmentation_code (opcional)
+    %% ==========================
+    %% Region A: Phase 1 + Phase 2
+    %% ==========================
+    state REGION_PHASE12 {
 
-Note over GW: Seguridad Gateway (JWSID)\n- Verifica firma (kid)\n- exp/iat/nbf\n- aud/iss\n- scopes/roles\n- correlation-id requerido
+      [*] --> P1_PENDING
 
-alt JWSID inválido / no autorizado
-  GW-->>U: 401 / 403
-else JWSID OK
-  GW->>MS: Forward Request\n(+identity context + correlationId)
+      %% Phase 1 (inmediate/basic data)
+      P1_PENDING --> P1_RUNNING : P1_START / action: runImmediateSearch
+      P1_RUNNING --> P1_NO_DATA : P1_NO_HITS / action: auditP1NoData
+      P1_RUNNING --> P1_HAS_DATA : P1_HAS_DATA / action: buildP1Payload
 
-  Note over MS: Validaciones Micro (funcionales)\n- customer_id presente/formato\n- segmentation_code permitido\n- headers requeridos\n- correlationId obligatorio
+      %% Outbound token mgmt for calling PUI
+      P1_HAS_DATA --> OUT_TOKEN_READY : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
+      OUT_TOKEN_READY --> P1_NOTIFYING : OUT_NOTIFY_P1 / action: outboxEnqueue(notificar,phase=1)
+      P1_NOTIFYING --> P1_NOTIFIED : OUT_HTTP_200 / action: auditOutOk,markOutboxSent
+      P1_NOTIFYING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
+      P1_NOTIFYING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
+      P1_NOTIFYING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
 
-  alt Error de validación
-    MS-->>GW: 400 Bad Request
-    GW-->>U: 400
-  else OK
+      P1_NO_DATA --> P1_DONE : P1_DONE
+      P1_NOTIFIED --> P1_DONE : P1_DONE
 
-    %% =========================================================
-    %% DDF (JDBC directo)
-    %% =========================================================
-    Note over MS,DB: DDF PE6A (Consulta JDBC)\nNo usa MQ / No usa Dispatcher\nObjetivo: obtener datos base + Aux.TIPPER (entre otros)
+      %% Phase 2 decision (skip if fecha_desaparicion is empty/null)
+      P1_DONE --> P2_DECIDE : P2_EVALUATE
+      state P2_DECIDE <<choice>>
+      P2_DECIDE --> P2_SKIPPED : [guard: fechaDesaparicionNull] / action: auditP2Skipped,computeWindow(today..today)
+      P2_DECIDE --> P2_RUNNING : [guard: else] / action: computeWindow(max12Years),startHistoricalAsync
 
-    MS->>DB: JDBC Query DDF_PE6A(customer_id, segmentation_code)
-    alt DDF sin información / KO
-      DB-->>MS: Empty/KO
-      MS-->>GW: 500 Not return information
-      GW-->>U: 500
-    else DDF OK
-      DB-->>MS: ResultSet (incluye Aux.TIPPER)
+      %% Phase 2 run/hits (each hit => notify phase=2)
+      P2_RUNNING --> P2_HIT_READY : P2_HIT / action: buildP2Payload(includeEventoFields)
+      P2_HIT_READY --> OUT_TOKEN_READY_2 : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
+      OUT_TOKEN_READY_2 --> P2_NOTIFYING : OUT_NOTIFY_P2 / action: outboxEnqueue(notificar,phase=2)
+      P2_NOTIFYING --> P2_RUNNING : OUT_HTTP_200 / action: auditOutOk,markOutboxSent,continueSearch
+      P2_NOTIFYING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
+      P2_NOTIFYING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
+      P2_NOTIFYING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
 
-      %% =========================================================
-      %% Reglas de negocio que disparan TRX
-      %% =========================================================
-      Note over MS: Evaluación de reglas\nA) si segmentation_code == "CM" o EMPTY/NULL -> TRX TCGG\nB) si (segmentation_code == "IN" o "IC" o EMPTY/NULL) y Aux.TIPPER == "J" -> TRX PEL1\nC) si (segmentation_code == "IN" o "IC" o EMPTY/NULL) y Aux.TIPPER == "F" -> TRX PEL2\n(Se agregan descripciones/catálogos a la respuesta final)
+      %% Phase 2 completion => MUST call /busqueda-finalizada always
+      P2_RUNNING --> P2_FINISHING : P2_DONE / action: auditP2Done
+      P2_SKIPPED --> P2_FINISHING : P2_SKIP_DONE / action: auditP2Done
 
-      %% ---------- TRX TCGG ----------
-      alt Regla A aplica (CM o vacío)
-        Note over MS,MQIN: Envío TRX TCGG vía MQ IN\n- payload TRX\n- correlationId\n- reply-to lógico (en header)\n- canalRedisDestino = segm.responses.channel
+      P2_FINISHING --> OUT_TOKEN_READY_F : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
+      OUT_TOKEN_READY_F --> P2_FINALIZADA_SENDING : OUT_FINALIZADA / action: outboxEnqueue(busquedaFinalizada)
+      P2_FINALIZADA_SENDING --> PHASE12_COMPLETED : OUT_HTTP_200 / action: auditFinalizadaOk,markOutboxSent
+      P2_FINALIZADA_SENDING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
+      P2_FINALIZADA_SENDING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
+      P2_FINALIZADA_SENDING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
 
-        MS->>MQIN: PUT message TRX_TCGG\n(correlationId, payload)
-        MQIN->>CORE: Deliver TRX_TCGG
-        CORE->>MQOUT: Produce response TRX_TCGG\n(correlationId, code, body)
+      PHASE12_COMPLETED --> [*]
+    }
 
-        Note over DISP,Redis: Dispatcher enruta respuesta\nMQ OUT -> Redis Publish (según correlationId/canal)
+    %% ==========================
+    %% Region B: Phase 3 Continuous (until /desactivar-reporte)
+    %% ==========================
+    state REGION_CONTINUOUS {
 
-        DISP->>MQOUT: CONSUME response (correlationId)
-        DISP->>Redis: PUBLISH segm.responses.channel\n(correlationId, TRX_TCGG response)
+      [*] --> C_ENABLING
+      C_ENABLING --> C_ACTIVE : C_START / action: registerInContinuousSystem,schedulePolling,auditCEnabled
 
-        Redis-->>MS: Deliver pubsub message\n(correlationId, response)
-        alt Respuesta TCGG OK\n(ResponseCode: TCA0006 FIN DE DATOS / OK esperado)
-          MS->>MS: Enriquecer descripciones/catálogos\ncon datos de TCGG
-        else Respuesta TCGG KO
-          MS-->>GW: 500 Error (TCGG KO)
-          GW-->>U: 500
-        end
-      else Regla A no aplica
-        Note over MS: Se omite TRX TCGG
-      end
+      %% periodic detection of new/modified records
+      C_ACTIVE --> C_MATCH_READY : C_MATCH_FOUND / action: buildP3Payload(includeEventoFields)
+      C_MATCH_READY --> OUT_TOKEN_READY_3 : NEED_PUI_TOKEN / action: ensureTokenValidOrRefresh
+      OUT_TOKEN_READY_3 --> C_NOTIFYING : OUT_NOTIFY_P3 / action: outboxEnqueue(notificar,phase=3)
+      C_NOTIFYING --> C_ACTIVE : OUT_HTTP_200 / action: auditOutOk,markOutboxSent
+      C_NOTIFYING --> OUT_AUTH_401 : OUT_HTTP_401 / action: auditOutAuthFail,markRetry
+      C_NOTIFYING --> OUT_ERROR_5XX : OUT_HTTP_5XX / action: auditOutServerErr,markRetry
+      C_NOTIFYING --> OUT_TIMEOUT_504 : OUT_HTTP_504 / action: auditOutTimeout,markRetry
 
-      %% ---------- TRX PEL1 ----------
-      alt Regla B aplica (IN/IC o vacío) y Aux.TIPPER == "J"
-        MS->>MQIN: PUT message TRX_PEL1\n(correlationId, payload)
-        MQIN->>CORE: Deliver TRX_PEL1
-        CORE->>MQOUT: Produce response TRX_PEL1\n(correlationId, code, body)
-        DISP->>MQOUT: CONSUME response (correlationId)
-        DISP->>Redis: PUBLISH segm.responses.channel\n(correlationId, TRX_PEL1 response)
-        Redis-->>MS: Deliver pubsub message\n(correlationId, response)
+      %% inbound: /desactivar-reporte
+      C_ACTIVE --> C_DEACT_REQUESTED : IN_DEACTIVATE_REPORT / action: auditInbound,stopScheduling
+      C_DEACT_REQUESTED --> C_DEACT_DONE : DEACT_OK / action: purgeCaseInternalState,auditCDisabled,respond200
+      C_DEACT_REQUESTED --> C_DEACT_AUTH_ERROR : IN_JWT_FAIL / action: auditAuthFail,respond401
 
-        alt Respuesta PEL1 OK\n(ResponseCode: ODA0029 OK, CONSULTA EXITOSA)
-          MS->>MS: Enriquecer descripciones/catálogos\ncon datos de PEL1
-        else Respuesta PEL1 KO
-          MS-->>GW: 500 Error (PEL1 KO)
-          GW-->>U: 500
-        end
-      else Regla B no aplica
-        Note over MS: Se omite TRX PEL1
-      end
+      C_DEACT_AUTH_ERROR --> C_ACTIVE : RESUME
+      C_DEACT_DONE --> [*]
+    }
 
-      %% ---------- TRX PEL2 ----------
-      alt Regla C aplica (IN/IC o vacío) y Aux.TIPPER == "F"
-        MS->>MQIN: PUT message TRX_PEL2\n(correlationId, payload)
-        MQIN->>CORE: Deliver TRX_PEL2
-        CORE->>MQOUT: Produce response TRX_PEL2\n(correlationId, code, body)
-        DISP->>MQOUT: CONSUME response (correlationId)
-        DISP->>Redis: PUBLISH segm.responses.channel\n(correlationId, TRX_PEL2 response)
-        Redis-->>MS: Deliver pubsub message\n(correlationId, response)
+    %% Join: machine can terminate when continuous stopped AND phase12 ended
+    state END_JOIN <<join>>
+    REGION_PHASE12 --> END_JOIN
+    REGION_CONTINUOUS --> END_JOIN
+    END_JOIN --> [*]
+  }
 
-        alt Respuesta PEL2 OK\n(ResponseCode: ODA0029 OK, CONSULTA EXITOSA)
-          MS->>MS: Enriquecer descripciones/catálogos\ncon datos de PEL2
-        else Respuesta PEL2 KO
-          MS-->>GW: 500 Error (PEL2 KO)
-          GW-->>U: 500
-        end
-      else Regla C no aplica
-        Note over MS: Se omite TRX PEL2
-      end
+  CASE_ACTIVE --> CASE_CLOSED : MACHINE_TERMINATED / action: auditCaseClosed
+  CASE_CLOSED --> [*]
 
-      %% =========================================================
-      %% RESPUESTA FINAL
-      %% =========================================================
-      Note over MS: Construcción de Response 200\n- segmentations[] enriquecido\n- segmentDescription / segmentCode\n- coherencia con reglas aplicadas
+  %% ======================
+  %% Outbound error substates (shared conceptual)
+  %% ======================
+  state OUT_AUTH_401 {
+    [*] --> OUT_REFRESH_TOKEN : OUT_RETRY / action: refreshToken(now),resendOutbox
+    OUT_REFRESH_TOKEN --> OUT_BACKOFF : TOKEN_OK / action: scheduleRetryWithBackoff
+    OUT_BACKOFF --> [*]
+  }
 
-      MS-->>GW: 200 OK + JSON response
-      GW-->>U: 200 OK
-    end
-  end
-end
+  state OUT_TIMEOUT_504 {
+    [*] --> OUT_BACKOFF_504 : OUT_RETRY / action: scheduleRetryWithBackoff
+    OUT_BACKOFF_504 --> [*]
+  }
+
+  state OUT_ERROR_5XX {
+    [*] --> OUT_BACKOFF_5XX : OUT_RETRY / action: scheduleRetryWithBackoff
+    OUT_BACKOFF_5XX --> [*]
+  }
