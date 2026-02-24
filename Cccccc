@@ -1,0 +1,76 @@
+sequenceDiagram
+autonumber
+
+actor U as User/Channel
+participant GW as API_Connect_GW
+participant MS as sgt-accounts-convertidentifiers (Microservice)
+participant IAM as IAM/STS (Introspection/JWKS/Policy) 
+participant DB as Exadata_Oracle (JDBC)
+
+%% =========================================================
+%% BOOTSTRAP (startup)
+%% =========================================================
+Note over MS: BOOTSTRAP (startup)
+
+MS->>MS: Load config (env/secret)\n- clientId allowlist\n- DB pool config\n- timeouts/retries\n- validation rules
+MS->>IAM: Fetch/refresh JWKS (issuer keys)\n(cache in-memory + rotation schedule)
+IAM-->>MS: JWKS (public keys + kid)
+MS->>MS: Init crypto providers\n- JCA providers\n- disable weak algs\n- secure random
+MS->>MS: Init observability\n- tracing\n- metrics\n- audit logger
+MS->>DB: Warmup JDBC pool / healthcheck
+DB-->>MS: OK
+Note over MS: Ready (liveness/ readiness = OK)
+
+%% =========================================================
+%% REQUEST FLOW
+%% =========================================================
+U->>GW: POST /v5/accounts/convert_identifiers\nHeaders:\n- Authorization: JWSID\n- x-santander-client-id\n- x-correlation-id\nBody: accounts[]
+
+%% ---------------- SECURITY @ GATEWAY ----------------
+Note over GW: Seguridad (Gateway)\n1) TLS/mTLS (si aplica)\n2) Validar JWSID:\n   - signature por kid (JWKS)\n   - exp/iat/nbf\n   - iss/aud\n   - scope/roles\n3) Rate-limit / WAF\n4) Correlation-id (crear si falta)
+
+alt JWSID ausente / inválido
+  GW-->>U: 401 Unauthorized
+else JWSID válido pero sin permisos
+  GW-->>U: 403 Forbidden
+else OK
+  GW->>MS: Forward request\n(+claims mínimos + correlationId)\nHeaders preserved
+
+  %% ---------------- SECURITY @ MICROSERVICE ----------------
+  Note over MS: Seguridad (Micro - defensa en profundidad)\nA) Re-validar JWSID (opcional pero recomendado):\n   - firma/exp/iss/aud\n   - x-santander-client-id vs claim/allowlist\nB) Input hardening:\n   - size limits (accounts[])\n   - JSON schema\n   - sanitización\nC) Audit trail (sin datos sensibles)\nD) Timeouts/circuit breaker DB
+
+  alt Validación headers/context falla
+    MS-->>GW: 401/403
+    GW-->>U: 401/403
+  else OK
+
+    %% ---------------- INPUT VALIDATION ----------------
+    Note over MS: Validate input data\n- accounts[] obligatorio y no vacío\n- cada elemento: accountIdentification\n- formatos/longitudes\n- límites (max accounts)\n- no duplicados (si regla aplica)
+
+    alt Validation error
+      MS-->>GW: 400 Bad Request (validation)
+      GW-->>U: 400
+    else OK
+
+      %% =========================================================
+      %% DDF JDBC DIRECT
+      %% =========================================================
+      Note over MS,DB: DDF = JDBC directo (NO TRX / NO MQ / NO Dispatcher / NO Redis)\nB485_DDF_019
+
+      MS->>DB: JDBC Query B485_DDF_019(accounts[])
+      alt DDF returns "no data" / business rule
+        DB-->>MS: KO (mapped to 4xx)
+        MS-->>GW: 400 (o 404 si está definido así)
+        GW-->>U: 400/404
+      else DB technical error
+        DB-->>MS: SQL/Timeout/Conn error
+        MS-->>GW: 500 (o 504 si timeout)
+        GW-->>U: 500/504
+      else DDF OK
+        DB-->>MS: OK + converted identifiers
+        MS-->>GW: 200 OK + response
+        GW-->>U: 200 OK
+      end
+
+  end
+end
