@@ -1,90 +1,74 @@
 stateDiagram-v2
     [*] --> INACTIVE
 
-    %% =========================
-    %% INBOUND: /activar-reporte
-    %% =========================
-    INACTIVE --> ACTIVATE_RECEIVED : IN_ACTIVATE_REPORT / auditInbound,createCase
-    ACTIVATE_RECEIVED --> ACTIVE : IN_JWT_OK & PAYLOAD_OK / respond200
-    ACTIVATE_RECEIVED --> REJECTED_401 : IN_JWT_FAIL / respond401,auditAuthFail
-    ACTIVATE_RECEIVED --> REJECTED_400 : PAYLOAD_INVALID / respond400,auditValidationFail
-    REJECTED_401 --> [*]
-    REJECTED_400 --> [*]
+    INACTIVE --> ACTIVATE_RECEIVED : IN_ACTIVATE_REPORT
+    ACTIVATE_RECEIVED --> ACTIVE : IN_JWT_OK & PAYLOAD_OK
+    ACTIVATE_RECEIVED --> REJECTED : IN_JWT_FAIL or PAYLOAD_INVALID
+    REJECTED --> [*]
 
-    %% =========================
-    %% MASTER: Caso activo por persona (caseId=id)
-    %% =========================
     state ACTIVE {
+
         [*] --> START_PARALLEL
 
         state START_PARALLEL <<fork>>
         START_PARALLEL --> PHASE12
         START_PARALLEL --> CONTINUOUS
 
-        %% -------------------------
-        %% REGION A: Fase 1 + Fase 2
-        %% -------------------------
+        %% =========================
+        %% REGION PHASE 1 + 2
+        %% =========================
         state PHASE12 {
+
             [*] --> P1_RUNNING
 
-            %% FASE 1 (inmediata / datos básicos)
-            P1_RUNNING --> P1_NOTIFYING : P1_HAS_DATA / outboxEnqueueNotify(phase=1)
-            P1_RUNNING --> P1_DONE : P1_NO_DATA / auditP1NoData
-            P1_NOTIFYING --> P1_DONE : OUT_NOTIFY_OK / auditOutOk
+            P1_RUNNING --> P1_NOTIFYING : P1_HAS_DATA
+            P1_RUNNING --> P1_DONE : P1_NO_DATA
+            P1_NOTIFYING --> P1_DONE : OUT_NOTIFY_OK
 
-            %% FASE 2 (histórica) - con decisión de skip
-            P1_DONE --> P2_DECIDE : P2_EVALUATE
+            P1_DONE --> P2_DECIDE
+
             state P2_DECIDE <<choice>>
-            P2_DECIDE --> P2_SKIPPED : [guard: fechaDesaparicionNull] / auditP2Skipped
-            P2_DECIDE --> P2_RUNNING : [guard: else] / startHistoricalAsync,computeWindowMax12Years
 
-            %% Notificaciones por coincidencia fase 2
-            P2_RUNNING --> P2_NOTIFYING : P2_HIT / outboxEnqueueNotify(phase=2)
-            P2_NOTIFYING --> P2_RUNNING : OUT_NOTIFY_OK / auditOutOk,continueSearch
+            P2_DECIDE --> P2_SKIPPED : fechaDesaparicionNull
+            P2_DECIDE --> P2_RUNNING : otherwise
 
-            %% Finalización obligatoria fase 2 (siempre)
-            P2_RUNNING --> P2_FINALIZING : P2_DONE / auditP2Done
-            P2_SKIPPED --> P2_FINALIZING : P2_SKIP_DONE / auditP2Done
+            P2_RUNNING --> P2_NOTIFYING : P2_HIT
+            P2_NOTIFYING --> P2_RUNNING : OUT_NOTIFY_OK
 
-            P2_FINALIZING --> PHASE12_DONE : OUT_FINALIZADA_OK / auditFinalizadaOk
+            P2_RUNNING --> P2_FINALIZING : P2_DONE
+            P2_SKIPPED --> P2_FINALIZING
+
+            P2_FINALIZING --> PHASE12_DONE : OUT_FINALIZADA_OK
             PHASE12_DONE --> [*]
 
-            %% Cancelación barata (stop + ACK) desde cualquier punto relevante
-            P1_RUNNING --> P12_STOPPING : IN_DEACTIVATE_REPORT / auditDeactRequest,signalStopP1,respond202
-            P1_NOTIFYING --> P12_STOPPING : IN_DEACTIVATE_REPORT / auditDeactRequest,signalStopP1,respond202
-            P2_RUNNING --> P12_STOPPING : IN_DEACTIVATE_REPORT / auditDeactRequest,signalStopP2,respond202
-            P2_NOTIFYING --> P12_STOPPING : IN_DEACTIVATE_REPORT / auditDeactRequest,signalStopP2,respond202
-            P2_FINALIZING --> P12_STOPPING : IN_DEACTIVATE_REPORT / auditDeactRequest,signalStopP2,respond202
-
-            P12_STOPPING --> P12_STOPPED : P12_STOPPED_ACK / auditStopped
+            %% Cancelación barata
+            P1_RUNNING --> P12_STOPPING : IN_DEACTIVATE_REPORT
+            P2_RUNNING --> P12_STOPPING : IN_DEACTIVATE_REPORT
+            P12_STOPPING --> P12_STOPPED : P12_STOPPED_ACK
             P12_STOPPED --> [*]
         }
 
-        %% -------------------------
-        %% REGION B: Fase 3 (continua)
-        %% -------------------------
+        %% =========================
+        %% REGION CONTINUA
+        %% =========================
         state CONTINUOUS {
-            [*] --> C_ACTIVE : C_START / enableContinuousMonitor,auditCEnabled
 
-            %% Coincidencias fase 3
-            C_ACTIVE --> C_NOTIFYING : C_MATCH / outboxEnqueueNotify(phase=3)
-            C_NOTIFYING --> C_ACTIVE : OUT_NOTIFY_OK / auditOutOk
+            [*] --> C_ACTIVE
 
-            %% Cancelación barata (stop + ACK)
-            C_ACTIVE --> C_STOPPING : IN_DEACTIVATE_REPORT / auditDeactRequest,signalStopContinuous,respond202
-            C_NOTIFYING --> C_STOPPING : IN_DEACTIVATE_REPORT / auditDeactRequest,signalStopContinuous,respond202
-            C_STOPPING --> C_STOPPED : CONT_STOPPED_ACK / auditStopped
+            C_ACTIVE --> C_NOTIFYING : C_MATCH
+            C_NOTIFYING --> C_ACTIVE : OUT_NOTIFY_OK
+
+            C_ACTIVE --> C_STOPPING : IN_DEACTIVATE_REPORT
+            C_NOTIFYING --> C_STOPPING : IN_DEACTIVATE_REPORT
+            C_STOPPING --> C_STOPPED : CONT_STOPPED_ACK
             C_STOPPED --> [*]
         }
 
-        %% -------------------------
-        %% Cierre coordinado: solo cuando ambas ramas terminaron/pararon
-        %% -------------------------
         state END_JOIN <<join>>
         PHASE12 --> END_JOIN
         CONTINUOUS --> END_JOIN
         END_JOIN --> [*]
     }
 
-    ACTIVE --> CLOSED : MACHINE_TERMINATED / auditCaseClosed
+    ACTIVE --> CLOSED : MACHINE_TERMINATED
     CLOSED --> [*]
