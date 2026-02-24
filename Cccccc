@@ -3,79 +3,192 @@ autonumber
 
 actor U as User/Channel
 participant GW as API_Connect_GW
-participant MS as API_Cards_Microservice
-participant PKM as PKM (Public Key Management)
-participant LOC as CardPlaceLocator
-participant ANON as Anonymizer_API
+participant AC as API_Cards (Microservice)
+participant PKM as PKM (Public Key Management / JWKS)
+participant CPE as Card_Processor_Eligibility / CardLocation
+participant AN as Anonymizer_API (PAN<->card_id)
+participant R as Redis (Pub/Sub)
 participant MQIN as IBM_MQ_IN
-participant CORE as Core_Gravity (Bank Core)
 participant MQOUT as IBM_MQ_OUT
-participant DISP as Dispatcher_Service
-participant PLARD as Plard_API
+participant DSP as Dispatcher_Service
+participant CORE as Gravity_Core (PAMPA / Banking Core)
+participant PL as Plard_API
 
 %% =========================================================
-%% BOOTSTRAP / STARTUP
+%% BOOTSTRAP (startup)
 %% =========================================================
-rect rgba(230,230,230,0.35)
-Note over MS: BOOTSTRAP (startup)
-MS->>MS: Load config/secrets\n- clientId allowlist\n- Redis channel prefix\n- MQ params\n- timeouts/retries\n- PKM issuer/audience
-MS->>PKM: Fetch JWKS (issuer public keys)
-PKM-->>MS: JWKS (kid -> publicKey)
-MS->>MS: Cache JWKS in-memory\n(refresh/rotation)
-MS->>MS: Init crypto providers + observability\n(tracing/metrics/audit)
-MS->>MS: Redis SUBSCRIBE\nchannel = redis:trx:reply:<ms-instance>
-MS->>MQIN: MQ connectivity check / health
-Note over DISP: Dispatcher already running
-DISP->>MQOUT: BOOTSTRAP subscribe/consume\n(from MQ OUT queue/topic)
+rect rgba(200,200,200,0.25)
+note over AC: BOOTSTRAP (startup)\n- Carga config/env/secrets\n- Define canales Redis (reply channels)\n- Init HTTP clients (Plard/CPE/Anonymizer)\n- Init MQ producer (MQ IN)\n- Init crypto providers\n- Observability (trace/metrics/audit)\n- Readiness/Liveness OK
+
+AC->>R: SUBSCRIBE reply-channel(s)\n(p.ej. cards.txn.reply.*)
+note over AC: Suscripción Redis se hace en bootstrap.\nEl micro ya sabe a qué canal escuchar.\nLa correlación se hace por msgId/correlationId.
+
+note over DSP: BOOTSTRAP (startup)\n- Conecta a MQ OUT\n- Consumer listener MQ OUT\n- Publica respuestas en Redis\n  al canal correspondiente (según msgId/correlationId)
+DSP->>MQOUT: START LISTEN (consumer)
+DSP->>R: Ready to PUBLISH to reply channels
 end
 
 %% =========================================================
 %% REQUEST FLOW
 %% =========================================================
-U->>GW: GET /card_transactions?... (card_id, params)\nHeaders: Authorization(JWSID/JWT), x-santander-client-id
-Note over GW: SECURITY @ GATEWAY\n1) TLS/mTLS (si aplica)\n2) Validate token signature (PKM JWKS)\n3) Validate claims: iss/aud/exp/nbf\n4) Validate client-id allowlist\n5) Rate limit / WAF / threat protections
-GW->>MS: Forward request\n+ propagated correlation-id\n+ validated principal/claims (según estándar interno)
+U->>GW: GET /card_transactions/transactions\nHeaders:\n- x-santander-client-id\n- Authorization: Bearer <JWT>\n- x-correlation-id (opcional)
 
-Note over MS: App-level security (defensa en profundidad)\n- re-validate mandatory claims\n- validate scopes/entitlements\n- input validation
+rect rgba(173,216,230,0.18)
+note over GW: SECURITY @ GATEWAY\n1) TLS/mTLS (si aplica)\n2) Validación JWT (exp, aud, iss)\n3) Policy enforcement (scopes/roles)\n4) Rate limit / threat protection\n5) Propaga correlation-id
+GW->>PKM: (opcional) Fetch/refresh JWKS (cache)
+PKM-->>GW: JWKS public keys (+kid)
+end
 
-MS->>LOC: Resolve card location by card_id
-LOC-->>MS: location = PAMPA | PLARD
+GW->>AC: Forward request (validated)\n+ claims relevantes + correlation-id
 
-alt location == PAMPA (Gravity / TRX path)
-    Note over MS: PAMPA requiere PAN\n=> desanonimizar CARID -> PAN (NO es DDF)
-    MS->>ANON: De-anonymize(card_id)\n(authn between services)
-    ANON-->>MS: PAN
+rect rgba(173,216,230,0.18)
+note over AC: SECURITY @ MICROSERVICE\n- Valida headers obligatorios\n- Valida autorización/claims (defensa en profundidad)\n- Sanitiza logs (no PAN)\n- Asigna msgId/correlationId interno
+end
 
-    Note over MS: Build TRX request\n- includes PAN + filters/pagination
-    MS->>MQIN: Put message(TRX=LWMK/LMWK...)\nheaders: msgId, correlationId, replyTo=MQOUT\nbody: request payload
-    MQIN-->>CORE: Deliver TRX request
-    CORE-->>MQOUT: TRX response\n(correlationId, status, payload/error)
+alt Validations not passed
+  AC-->>GW: 400 Bad Request
+  GW-->>U: 400
+else Validations OK
+  %% =========================================================
+  %% Decide PAMPA vs PLARD
+  %% =========================================================
+  AC->>CPE: GET /card_processor_eligibility\n(card_id)\n=> migration_status / location
+  alt Error dependency (CPE down/timeout)
+    AC-->>GW: 502/503 Dependency Error
+    GW-->>U: 502/503
+  else CPE OK
+    CPE-->>AC: location = PAMPA | PLARD\n+ cardType (Debit/Credit)\n+ status_code (Pending/Posted/Empty)\n(+ otros flags)
 
-    Note over DISP: Dispatcher consumes MQ OUT\nand publishes to Redis channel based on correlationId mapping
-    DISP->>MQOUT: Consume response (listener)
-    DISP->>DISP: Resolve target channel\n(channel = redis:trx:reply:<ms-instance>)
-    DISP->>MS: Publish to Redis channel\n(payload + correlationId)
+    alt location == PAMPA (Gravity/Core)
+      %% =========================================================
+      %% PAMPA FLOW (Gravity/Core via MQ + Dispatcher + Redis)
+      %% =========================================================
+      rect rgba(255,236,179,0.25)
+      note over AC: PAMPA FLOW\n- PAMPA/CORE trabaja con PAN\n- Debe desanonimizar card_id -> PAN\n- Luego ejecutar TRX via MQ IN\n- Esperar respuesta por Redis (pub/sub)\n- Dispatcher escucha MQ OUT y publica en Redis
+      end
 
-    Note over MS: MS is subscribed since bootstrap\nWait by correlationId (async->sync bridge)
-    MS-->>MS: Match correlationId\nassemble API response DTO
+      %% --- "DDF_PRINCIPAL" real: call anonymizer ---
+      AC->>AN: POST /deanonymize\n(card_id)  %% (esto reemplaza el "DDF_PRINCIPAL")
+      alt Error dependency (AN down/timeout)
+        AC-->>GW: 502/503 Dependency Error
+        GW-->>U: 502/503
+      else AN OK
+        AN-->>AC: PAN (clear inside AC memory)\n*No loggear PAN*
+        note over AC: PAN sólo se usa para construir TRX.\nNo se persiste, no se imprime en logs.\nSe limpia referencia ASAP.
 
-    alt TRX error / timeout
-        MS-->>GW: Error 4xx/5xx mapped\n(include error code + correlationId)
-        GW-->>U: Error response
-    else TRX OK
-        MS-->>GW: 200/206 response
-        GW-->>U: Response
+        %% --- Debit vs Credit mapping ---
+        alt cardType == Debit
+          rect rgba(255,243,205,0.35)
+          note over AC: DEBIT\n1) LMWK (consulta base)\n2) Validations\n3) LMVE (detalle / movimientos)\n(Mapper a response)
+          end
+
+          %% TRX LMWK
+          AC->>AC: Build TRX LMWK request\n(correlationId/msgId, PAN, params)
+          AC->>MQIN: PUT message TRX=LMWK\nmsgId=<id>\nreply-to=<redis-channel>
+          note over MQIN: MQ IN recibe solicitud.\nCORE la consume del lado bancario.
+
+          CORE-->>MQOUT: TRX LMWK response\nmsgId=<id>\n(payload/errorCode)
+          DSP->>MQOUT: Consume message (LMWK response)
+          DSP->>R: PUBLISH reply-channel\nkey=msgId\npayload=LMWK response
+          R-->>AC: Message delivered (pub/sub)\nLMWK response
+
+          alt TRX LMWK error
+            AC-->>GW: 502/500 (según mapeo)\n(errorCode)
+            GW-->>U: 502/500
+          else TRX LMWK OK
+            AC->>AC: Business validations (debit)\n(rules/filters)
+            alt validations not passed
+              AC-->>GW: 400 Bad Request
+              GW-->>U: 400
+            else validations OK
+              %% TRX LMVE
+              AC->>AC: Build TRX LMVE request\n(PAN, params, msgId2)
+              AC->>MQIN: PUT message TRX=LMVE\nmsgId=<id2>\nreply-to=<redis-channel>
+
+              CORE-->>MQOUT: TRX LMVE response\nmsgId=<id2>
+              DSP->>MQOUT: Consume LMVE response
+              DSP->>R: PUBLISH reply-channel\nkey=msgId2\npayload=LMVE response
+              R-->>AC: Message delivered\nLMVE response
+
+              alt TRX LMVE error
+                AC-->>GW: 502/500
+                GW-->>U: 502/500
+              else TRX LMVE OK
+                AC->>AC: Map to API response model\n(debit)
+                AC-->>GW: 200 OK
+                GW-->>U: 200 OK
+              end
+            end
+          end
+
+        else cardType == Credit
+          rect rgba(255,243,205,0.35)
+          note over AC: CREDIT\n- Si status_code = Pending/EMPTY => LMWZ (paginado/loop)\n- Si status_code = Posted/EMPTY => LMGN\n(Mapper a response)
+          end
+
+          alt status_code == Pending or EMPTY
+            %% LOOP / pagination for LMWZ
+            loop while hasMoreElements
+              AC->>AC: Build TRX LMWZ request\n(PAN, offset/limit, msgIdN)
+              AC->>MQIN: PUT message TRX=LMWZ\nmsgId=<idN>\nreply-to=<redis-channel>
+
+              CORE-->>MQOUT: TRX LMWZ response\nmsgId=<idN>
+              DSP->>MQOUT: Consume LMWZ response
+              DSP->>R: PUBLISH reply-channel\nkey=msgIdN\npayload=LMWZ response
+              R-->>AC: Message delivered\nLMWZ response
+
+              alt TRX LMWZ error
+                AC-->>GW: 502/500
+                GW-->>U: 502/500
+              else TRX LMWZ OK
+                AC->>AC: Append results + evaluate hasMoreElements
+              end
+            end
+
+            AC->>AC: Map aggregated LMWZ results\n(credit pending)
+            AC-->>GW: 200 OK
+            GW-->>U: 200 OK
+
+          else status_code == Posted or EMPTY
+            %% Single TRX LMGN
+            AC->>AC: Build TRX LMGN request\n(PAN, params, msgId3)
+            AC->>MQIN: PUT message TRX=LMGN\nmsgId=<id3>\nreply-to=<redis-channel>
+
+            CORE-->>MQOUT: TRX LMGN response\nmsgId=<id3>
+            DSP->>MQOUT: Consume LMGN response
+            DSP->>R: PUBLISH reply-channel\nkey=msgId3\npayload=LMGN response
+            R-->>AC: Message delivered\nLMGN response
+
+            alt TRX LMGN error
+              AC-->>GW: 502/500
+              GW-->>U: 502/500
+            else TRX LMGN OK
+              AC->>AC: Map to API response model\n(credit posted)
+              AC-->>GW: 200 OK
+              GW-->>U: 200 OK
+            end
+          end
+        end
+      end
+
+    else location == PLARD
+      %% =========================================================
+      %% PLARD FLOW (Direct REST API)
+      %% =========================================================
+      rect rgba(204,255,204,0.22)
+      note over AC: PLARD FLOW\n- No transaccional (no MQ/Redis)\n- Se invoca API Plard (REST)\n- No requiere PAN\n- Mapeo de respuesta a modelo legado\n- Manejo de errores dependencia
+      end
+
+      AC->>PL: GET /v3/card_transactions/transactions\n(card_id, filtros)\nHeaders:\n- x-santander-client-id\n- correlation-id
+      alt Plard dependency error
+        AC-->>GW: 502/503 Dependency Error
+        GW-->>U: 502/503
+      else Plard OK
+        PL-->>AC: 200/204 + payload
+        AC->>AC: Map Plard response -> Legacy Model
+        AC-->>GW: 200/204
+        GW-->>U: 200/204
+      end
     end
-
-else location == PLARD (API path)
-    Note over MS: PLARD se consume por API REST\nNO hay MQ/Dispatcher/Redis PubSub aquí
-    %% (Si aplica) desanonimización sólo si PLARD requiere PAN.\n(Si PLARD trabaja por card_id, se omite.)
-    MS->>PLARD: GET /v3/card_transactions/transactions\n(params)\nHeaders: auth between services
-    alt PLARD error
-        MS-->>GW: Error 4xx/5xx mapped\n(include correlationId)
-        GW-->>U: Error response
-    else PLARD OK
-        MS-->>GW: 200/206 response
-        GW-->>U: Response
-    end
+  end
 end
