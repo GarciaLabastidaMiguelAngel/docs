@@ -146,7 +146,7 @@ ContextualizedAssessmentResponse    (status = READY_FOR_RISK_SCORING)
 
 | Herramienta | Versión mínima |
 |-------------|---------------|
-| Java        | 21            |
+| Java        | 17 (diseñado para 21+) |
 | Maven       | 3.9+          |
 | Spring Boot | 3.2.x         |
 

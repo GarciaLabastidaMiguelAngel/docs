@@ -19,7 +19,6 @@
     <description>Adaptive Enterprise Risk Calculator – Contextual Engine V1</description>
 
     <properties>
-        <!-- Target Java 17 for build compatibility; upgrade to 21 when JDK 21 is available -->
         <java.version>17</java.version>
     </properties>
 
